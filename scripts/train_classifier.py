@@ -47,6 +47,11 @@ class ClassifierTrainConfig:
         "demo00004",
     ])
     val_demo_ids: List[str] = field(default_factory=lambda: ["demo00005"])
+    # PATCH (2026-07-22, TUM repro): per-embodiment id override (same as train_policy.py) —
+    # the paper's 5-robot + 100-human setting is inexpressible with shared ids.
+    # None = legacy shared-ids behavior.
+    human_train_demo_ids: Optional[List[str]] = None
+    human_val_demo_ids: Optional[List[str]] = None
     data_root: Optional[str] = None
     torch_compile: bool = False
     num_train_timesteps: int = 101
@@ -91,10 +96,17 @@ def build_dataset_dirs(cfg: ClassifierTrainConfig, data_root: Path, run_dir: Pat
     }
 
 
+def human_demo_ids(cfg: ClassifierTrainConfig, partition: str) -> List[str]:
+    """Human-source id list for a partition; falls back to the shared robot ids."""
+    if partition == "train":
+        return list(cfg.human_train_demo_ids) if cfg.human_train_demo_ids is not None else list(cfg.train_demo_ids)
+    return list(cfg.human_val_demo_ids) if cfg.human_val_demo_ids is not None else list(cfg.val_demo_ids)
+
+
 def write_fixed_split(run_dir: Path, cfg: ClassifierTrainConfig) -> Path:
     split = {
-        "train": {"robot": list(cfg.train_demo_ids), "human": list(cfg.train_demo_ids)},
-        "val": {"robot": list(cfg.val_demo_ids), "human": list(cfg.val_demo_ids)},
+        "train": {"robot": list(cfg.train_demo_ids), "human": human_demo_ids(cfg, "train")},
+        "val": {"robot": list(cfg.val_demo_ids), "human": human_demo_ids(cfg, "val")},
     }
     split_path = run_dir / "fixed_split.json"
     split_path.write_text(json.dumps(split, indent=2, sort_keys=True) + "\n")
@@ -126,7 +138,6 @@ def audit_demo_file(path: Path, pred_horizon: int) -> Dict[str, Any]:
 
 
 def audit_selected_demos(wrapper_dirs: Dict[str, Path], cfg: ClassifierTrainConfig) -> Dict[str, Any]:
-    requested = cfg.train_demo_ids + cfg.val_demo_ids
     report: Dict[str, Any] = {
         "task": cfg.task,
         "mode": "classifier",
@@ -139,6 +150,11 @@ def audit_selected_demos(wrapper_dirs: Dict[str, Path], cfg: ClassifierTrainConf
         "no_skipped_or_corrupt_episodes": True,
     }
     for dataset_type, wrapper_dir in wrapper_dirs.items():
+        # per-embodiment id list (PATCH 2026-07-22): audit each source against its own demos
+        if dataset_type == "robot":
+            requested = list(cfg.train_demo_ids) + list(cfg.val_demo_ids)
+        else:
+            requested = human_demo_ids(cfg, "train") + human_demo_ids(cfg, "val")
         entries = []
         for demo_id in requested:
             info = audit_demo_file(wrapper_dir / f"{demo_id}.h5", cfg.pred_horizon)

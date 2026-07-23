@@ -49,6 +49,13 @@ class PolicyTrainConfig:
         "demo00004",
     ])
     val_demo_ids: List[str] = field(default_factory=lambda: ["demo00005"])
+    # PATCH (2026-07-22, TUM repro): the release forces the SAME demo ids onto every
+    # embodiment, which cannot express the paper's own 5-robot + 100-human setting
+    # (the audit then demands demo00006..99 exist in the robot dir and errors out).
+    # When set, these override the id lists for the human/human_filtered source only;
+    # None keeps the legacy shared-ids behavior byte-identical.
+    human_train_demo_ids: Optional[List[str]] = None
+    human_val_demo_ids: Optional[List[str]] = None
     data_root: Optional[str] = None
     torch_compile: bool = False
     integrate_classifier: bool = False
@@ -56,6 +63,11 @@ class PolicyTrainConfig:
     num_train_timesteps: int = 101
     classifier_checkpoint_path: Optional[str] = None
     classifier_run_dir: Optional[str] = None
+    # PATCH (2026-07-23): human rows supervise POSITION dims only; the grasp dim (last)
+    # is supervised by robot rows alone (MT-pi's proven grasp surgery — offline eval showed
+    # the ungated grasp head fires 60 steps early at z=0.49 vs GT 0.442).
+    grasp_dim_robot_only: bool = False
+    flip_oversample_factor: float = 1.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,6 +129,13 @@ def build_dataset_dirs(cfg: PolicyTrainConfig, data_root: Path, run_dir: Path) -
     return resolve_source_dirs(cfg, data_root)
 
 
+def human_demo_ids(cfg: PolicyTrainConfig, partition: str) -> List[str]:
+    """Human-source id list for a partition; falls back to the shared robot ids."""
+    if partition == "train":
+        return list(cfg.human_train_demo_ids) if cfg.human_train_demo_ids is not None else list(cfg.train_demo_ids)
+    return list(cfg.human_val_demo_ids) if cfg.human_val_demo_ids is not None else list(cfg.val_demo_ids)
+
+
 def write_fixed_split(run_dir: Path, cfg: PolicyTrainConfig) -> Path:
     include_human = get_human_source_embodiment(cfg) is not None
     split = {
@@ -125,8 +144,8 @@ def write_fixed_split(run_dir: Path, cfg: PolicyTrainConfig) -> Path:
     }
     if include_human:
         human_key = get_human_source_embodiment(cfg)
-        split["train"][human_key] = list(cfg.train_demo_ids)
-        split["val"][human_key] = list(cfg.val_demo_ids)
+        split["train"][human_key] = human_demo_ids(cfg, "train")
+        split["val"][human_key] = human_demo_ids(cfg, "val")
     split_path = run_dir / "fixed_split.json"
     split_path.write_text(json.dumps(split, indent=2, sort_keys=True) + "\n")
     return split_path
@@ -165,7 +184,6 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 
 
 def audit_selected_demos(wrapper_dirs: Dict[str, Path], source_dirs: Dict[str, Path], cfg: PolicyTrainConfig) -> Dict[str, Any]:
-    requested = cfg.train_demo_ids + cfg.val_demo_ids
     human_source = get_human_source_embodiment(cfg)
     report: Dict[str, Any] = {
         "task": cfg.task,
@@ -184,6 +202,13 @@ def audit_selected_demos(wrapper_dirs: Dict[str, Path], source_dirs: Dict[str, P
     }
     for dataset_type, wrapper_dir in wrapper_dirs.items():
         source_dir = source_dirs[dataset_type]
+        # per-embodiment id list (PATCH 2026-07-22): audit each source against ITS OWN
+        # requested demos, not the union — robot dirs must not be required to contain
+        # the human ids and vice versa.
+        if dataset_type == "robot":
+            requested = list(cfg.train_demo_ids) + list(cfg.val_demo_ids)
+        else:
+            requested = human_demo_ids(cfg, "train") + human_demo_ids(cfg, "val")
         entries = []
         for demo_id in requested:
             info = audit_demo_file(wrapper_dir / f"{demo_id}.h5", cfg.pred_horizon)
@@ -363,6 +388,7 @@ def run_training(cfg: PolicyTrainConfig) -> int:
         pred_horizon=cfg.pred_horizon,
         action_horizon=cfg.action_horizon,
         balanced_sampling_weights=tuple(cfg.balanced_sampling_weights) if cfg.balanced_sampling_weights else None,
+        flip_oversample_factor=cfg.flip_oversample_factor,
     )
     physical_paths = [str(dataset_dirs["robot"])]
     human_source = get_human_source_embodiment(cfg)
@@ -470,6 +496,11 @@ def run_training(cfg: PolicyTrainConfig) -> int:
                 loss_masks, mask_stats = compute_xdiffusion_loss_masks(batch, probabilities, cfg.threshold)
                 if mask_stats["robot_included"] != mask_stats["robot_total"]:
                     raise RuntimeError("Robot actions were not all included in policy loss")
+                if cfg.grasp_dim_robot_only:
+                    D_act = batch.action.shape[-1]
+                    m = loss_masks[:, None].repeat(1, D_act)
+                    m[:, -1] = (batch.label == 1).float()
+                    loss_masks = m[:, None, :]
                 loss, _ = policy.unified_loss(batch, timesteps=timesteps, loss_masks=loss_masks)
                 for key in epoch_masking:
                     epoch_masking[key] += mask_stats[key]
@@ -507,6 +538,11 @@ def run_training(cfg: PolicyTrainConfig) -> int:
                     loss_masks, mask_stats = compute_xdiffusion_loss_masks(batch, probabilities, cfg.threshold)
                     if mask_stats["robot_included"] != mask_stats["robot_total"]:
                         raise RuntimeError("Robot actions were not all included in X-Diffusion validation loss")
+                    if cfg.grasp_dim_robot_only:
+                        D_act = batch.action.shape[-1]
+                        m = loss_masks[:, None].repeat(1, D_act)
+                        m[:, -1] = (batch.label == 1).float()
+                        loss_masks = m[:, None, :]
                     loss, _ = policy.unified_loss(batch, timesteps=timesteps, loss_masks=loss_masks)
                 else:
                     loss, _ = policy.loss(batch, action_mse=True)

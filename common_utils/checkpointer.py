@@ -40,29 +40,19 @@ class Checkpointer:
         latest_checkpoint_path = self.save_dir / "latest.pth"
         torch.save(checkpoint, latest_checkpoint_path)
 
-        # Manage best checkpoints (keep only 2)
-        # if len(self.best_checkpoints) < self.num_best:
-        #     heapq.heappush(self.best_checkpoints, (-val_loss, checkpoint_path))
-        # else:
-        #     heapq.heappushpop(self.best_checkpoints, (-val_loss, checkpoint_path))
-
-        # Manage recent checkpoints (keep only 5)
-        # self.recent_checkpoints.append((epoch, checkpoint_path))
-        # if len(self.recent_checkpoints) > self.num_recent:
-        #     _, old_path = self.recent_checkpoints.pop(0)
-        #     if old_path not in {path for _, path in self.best_checkpoints}:
-        #         old_path.unlink()
-
-        # # Update latest checkpoint
-        # self.latest_checkpoint = checkpoint_path
-
-        # # Remove checkpoints that are neither in the best 2 nor in the recent 5
-        # keep_checkpoints = {path for _, path in self.best_checkpoints}.union(
-        #     {path for _, path in self.recent_checkpoints}
-        # )
-        # for checkpoint_path in self.save_dir.glob("checkpoint_*.pth"):
-        #     if checkpoint_path not in keep_checkpoints:
-        #         checkpoint_path.unlink()
+        # PATCH (2026-07-22, TUM repro): the release saved EVERY epoch (~630MB each with
+        # the optimizer state) and the pruning below was commented out -> a 200-epoch run
+        # wrote 147GB and filled the disk (the xdiffusion cell crashed mid-torch.save).
+        # Keep only the best-val epoch file + the most recent epoch file + latest.pth.
+        self.recent_checkpoints.append((epoch, checkpoint_path))
+        if val_loss < getattr(self, "_best_val", float("inf")):
+            self._best_val = val_loss
+            self._best_path = checkpoint_path
+        keep = {self.recent_checkpoints[-1][1], getattr(self, "_best_path", checkpoint_path)}
+        for old in self.save_dir.glob("checkpoint_epoch_*.pth"):
+            if old not in keep:
+                old.unlink(missing_ok=True)
+        self.latest_checkpoint = checkpoint_path
 
     def load_best(
         self,

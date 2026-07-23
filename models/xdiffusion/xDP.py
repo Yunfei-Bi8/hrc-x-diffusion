@@ -21,8 +21,28 @@ from models.policy_nets import ConditionalUnet1D, TransformerForDiffusion
 from models.train_utils import absolute_to_delta_action, delta_to_absolute_action
 from models.keypoint_map_predictor import load_keypoint_map_predictor
 from common_utils.data_aug import RandomShiftsAug
-from baselines.models.action_normalizer import ActionNormalizer
-from baselines.models.dp_net import MultiviewCondUnet, MultiviewCondUnetConfig
+
+# PATCH (2026-07-22, TUM repro): the public release ships no `baselines` package, so the
+# original imports crash every consumer of this module (incl. scripts/train_policy.py)
+# at import time. Stub them the same way models/xdiffusion/hr_classifier.py already stubs
+# MultiviewHalfUnet — only the image-based ImageDiffusionPolicy (unused by the released
+# state-only pipeline) needs them, and it now raises cleanly on instantiation instead.
+@dataclass
+class MultiviewCondUnetConfig:
+    pass
+
+
+class MultiviewCondUnet:
+    def __init__(self, *args, **kwargs):
+        raise ImportError(
+            "ImageDiffusionPolicy requires `baselines`, which is intentionally not "
+            "included in the public X-Diffusion release."
+        )
+
+
+class ActionNormalizer:
+    def __init__(self, *args, **kwargs):
+        raise ImportError("ActionNormalizer requires `baselines` (not in the public release).")
 
 
 @dataclass
@@ -362,7 +382,11 @@ class DiffusionPolicy(nn.Module):
         noise_loss = nn.functional.mse_loss(noise_pred, noise, reduction="none")
         action_noise_loss = noise_loss[:, :, :-1]
         grasp_noise_loss = noise_loss[:, :, -1:]
-        action_loss = (noise_loss*loss_masks[:, None, None]).sum(dim=2)
+        # PATCH (2026-07-23): per-dim masks (B,1,D) supported — used for grasp-dim
+        # robot-only supervision (human fly-through pinch timing corrupted the grasp head;
+        # same conflict MT-pi's grasp_from_robot_only fixed).
+        m = loss_masks[:, None, None] if loss_masks.dim() == 1 else loss_masks
+        action_loss = (noise_loss * m).sum(dim=2)
 
         if avg:
             # Reduction from official DP repo

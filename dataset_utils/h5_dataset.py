@@ -100,7 +100,12 @@ class H5DatasetConfig:
     cond_source: str = "tracks_3d"
     
     # Balanced sampling settings
-    balanced_sampling_weights: Optional[tuple] = (0.5, 0.5)  # e.g., (0.5, 0.5) for equal sampling from labels 0 and 1
+    balanced_sampling_weights: Optional[tuple] = (0.5, 0.5)
+    # PATCH (2026-07-23): oversample windows whose ACTION grasp dim contains an
+    # open<->close transition. Grasp initiation is a rare event (~1-2% of windows);
+    # without boosting, the policy learns the copy-through shortcut (output grasp =
+    # input grip) and never initiates a close from grip=1 at deploy (measured 0.999).
+    flip_oversample_factor: float = 1.0  # e.g., (0.5, 0.5) for equal sampling from labels 0 and 1
     
     # Image loading settings
     load_images: bool = False  # Whether to load images from the dataset
@@ -271,6 +276,7 @@ class H5Dataset(torch.utils.data.Dataset):
             return torch.ones(len(self), dtype=torch.float32)
         
         # Create sample weights
+        boost = float(getattr(self.cfg, "flip_oversample_factor", 1.0) or 1.0)
         sample_weights = []
         for dataset_type, local_idx in self.unified_indices:
             label = 0 if dataset_type == "human" else 1
@@ -280,10 +286,13 @@ class H5Dataset(torch.utils.data.Dataset):
                 # Normalize by the actual count to achieve the desired ratio
                 if label_dist[label] > 0:
                     weight = weight * total_samples / (len(balanced_weights) * label_dist[label])
-                sample_weights.append(weight)
             else:
-                sample_weights.append(1.0)
-        
+                weight = 1.0
+            if boost > 1.0:
+                g = self.train_data["action"][dataset_type][local_idx][:, -1]
+                if (g[1:] != g[:-1]).any():
+                    weight *= boost
+            sample_weights.append(weight)
         return torch.tensor(sample_weights, dtype=torch.float32)
 
     def __len__(self) -> int:
