@@ -68,6 +68,18 @@ class PolicyTrainConfig:
     # the ungated grasp head fires 60 steps early at z=0.49 vs GT 0.442).
     grasp_dim_robot_only: bool = False
     flip_oversample_factor: float = 1.0
+    use_interferer: bool = False
+    # vis-forced admission (HRC avoidance recipe): ALWAYS supervise interferer-visible
+    # human rows. Correct when human data is the SOLE source of the conditioned
+    # behavior (24-07 retreat); WRONG when robot demos carry it too (handover) —
+    # there vis is ~saturated (94%) and forcing would disable gating wholesale.
+    vis_force_admission: bool = True
+    interferer_neg_dropout: float = 0.0
+    interferer_oversample_factor: float = 1.0
+    use_wandb: bool = False
+    wandb_project: str = "x-diffusion-hrc"
+    wandb_entity: str = "yunfei1999a-technical-university-of-munich"
+    wandb_run_name: Optional[str] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -313,7 +325,9 @@ def load_frozen_classifier(cfg: PolicyTrainConfig, state_cond_dim: int, action_d
     checkpoint_path = resolve_classifier_checkpoint(cfg)
     classifier_cfg = HumanRobotClassifierConfig(num_train_timesteps=cfg.num_train_timesteps)
     classifier = HumanRobotClassifier(
-        obs_horizon=cfg.obs_horizon,
+        # the frozen classifier is ALWAYS obs_horizon=1 (how it was trained); when the
+        # policy uses obs_horizon>1, the call sites feed it the LAST obs frame only.
+        obs_horizon=1,
         state_cond_dim=state_cond_dim,
         action_dim=action_dim,
         cfg=classifier_cfg,
@@ -333,7 +347,8 @@ def load_frozen_classifier(cfg: PolicyTrainConfig, state_cond_dim: int, action_d
     return classifier, provenance
 
 
-def compute_xdiffusion_loss_masks(batch, probabilities, threshold: float):
+def compute_xdiffusion_loss_masks(batch, probabilities, threshold: float,
+                                  vis_force: bool = True):
     import torch
 
     human_mask = batch.label == 0
@@ -342,9 +357,19 @@ def compute_xdiffusion_loss_masks(batch, probabilities, threshold: float):
     include_mask[robot_mask] = 1.0
     predicted_robot = probabilities > threshold
     include_mask[human_mask & predicted_robot] = 1.0
+    # HRC: interferer-visible rows are the sole source of avoidance behavior in the
+    # data (robot demos contain no retreat) — always supervise them, same precedent
+    # as the graspall grasp-dim bypass. Sentinel rows (vis=0) are unaffected.
+    vis_forced = 0
+    if vis_force and batch.state_cond is not None and batch.state_cond.shape[-1] >= 10:
+        vis_rows = (batch.state_cond[..., 9] > 0.5).any(dim=-1)
+        forced = human_mask & vis_rows & (~predicted_robot)
+        include_mask[human_mask & vis_rows] = 1.0
+        vis_forced = int(forced.sum().item())
     stats = {
         "human_total": int(human_mask.sum().item()),
-        "human_included": int((human_mask & predicted_robot).sum().item()),
+        "human_included": int((include_mask[human_mask] > 0).sum().item()),
+        "human_vis_forced": vis_forced,
         "robot_total": int(robot_mask.sum().item()),
         "robot_included": int(include_mask[robot_mask].sum().item()),
     }
@@ -389,6 +414,9 @@ def run_training(cfg: PolicyTrainConfig) -> int:
         action_horizon=cfg.action_horizon,
         balanced_sampling_weights=tuple(cfg.balanced_sampling_weights) if cfg.balanced_sampling_weights else None,
         flip_oversample_factor=cfg.flip_oversample_factor,
+        use_interferer=cfg.use_interferer,
+        interferer_oversample_factor=cfg.interferer_oversample_factor,
+        interferer_neg_dropout=cfg.interferer_neg_dropout,
     )
     physical_paths = [str(dataset_dirs["robot"])]
     human_source = get_human_source_embodiment(cfg)
@@ -442,7 +470,7 @@ def run_training(cfg: PolicyTrainConfig) -> int:
 
     policy = instantiate_policy(
         action_dim=train_loader.dataset.action_dim,
-        state_cond_dim=train_loader.dataset.state_cond_dim,
+        state_cond_dim=train_loader.dataset.state_cond_dim // cfg.obs_horizon,
         num_points=dataset_cfg.num_points,
         cfg=cfg,
     )
@@ -455,7 +483,9 @@ def run_training(cfg: PolicyTrainConfig) -> int:
     if cfg.mode == "xdiffusion":
         classifier, classifier_provenance = load_frozen_classifier(
             cfg,
-            state_cond_dim=train_loader.dataset.state_cond_dim,
+            # D1: the classifier is trained on the 7-dim dynamics slice only; the
+            # interferer dims never reach it (batch is sliced at the call sites too).
+            state_cond_dim=7 if cfg.use_interferer else train_loader.dataset.state_cond_dim // cfg.obs_horizon,
             action_dim=train_loader.dataset.action_dim,
             device=cfg.device,
         )
@@ -468,13 +498,18 @@ def run_training(cfg: PolicyTrainConfig) -> int:
     val_epoch_losses: List[float] = []
     train_loader_iter = iter(train_loader)
     masking_rows: List[Dict[str, Any]] = []
+    wb = None
+    if cfg.use_wandb:
+        import wandb as wb
+        wb.init(project=cfg.wandb_project, entity=cfg.wandb_entity,
+                name=cfg.wandb_run_name or cfg.run_name, config=asdict(cfg))
 
     for epoch_idx in range(cfg.epochs):
         policy.train()
         step_losses: List[float] = []
         grad_norms: List[float] = []
         epoch_start = time.time()
-        epoch_masking = {"human_total": 0, "human_included": 0, "robot_total": 0, "robot_included": 0}
+        epoch_masking = {"human_total": 0, "human_included": 0, "human_vis_forced": 0, "robot_total": 0, "robot_included": 0}
         timestep_min = None
         timestep_max = None
 
@@ -488,12 +523,21 @@ def run_training(cfg: PolicyTrainConfig) -> int:
 
             if cfg.mode == "xdiffusion":
                 timesteps = torch.randint(low=0, high=cfg.num_train_timesteps, size=(batch.label.shape[0],), device=cfg.device).long()
+                # D1 (2026-07-27, HRC): the classifier judges DYNAMICS feasibility only —
+                # slice off the interferer columns. Robot rows carry sentinel interferer
+                # values, so an 11-dim classifier would learn the trivial "vis=1 => human"
+                # shortcut and gate out exactly the avoidance supervision.
+                cls_sc = batch.state_cond[:, -1:, :]      # frozen classifier is obs_horizon=1
+                if cfg.use_interferer:
+                    cls_sc = cls_sc[..., :7]              # D1: dynamics slice only
+                cls_batch = batch._replace(state_cond=cls_sc)
                 with torch.no_grad():
-                    logits = classifier.unified_forward(batch, timesteps=timesteps)
+                    logits = classifier.unified_forward(cls_batch, timesteps=timesteps)
                     probabilities = torch.sigmoid(logits.squeeze(-1))
                 if not torch.isfinite(probabilities).all():
                     raise RuntimeError("Non-finite classifier probabilities during X-Diffusion training")
-                loss_masks, mask_stats = compute_xdiffusion_loss_masks(batch, probabilities, cfg.threshold)
+                loss_masks, mask_stats = compute_xdiffusion_loss_masks(batch, probabilities, cfg.threshold,
+                                                                       vis_force=cfg.vis_force_admission)
                 if mask_stats["robot_included"] != mask_stats["robot_total"]:
                     raise RuntimeError("Robot actions were not all included in policy loss")
                 if cfg.grasp_dim_robot_only:
@@ -531,11 +575,16 @@ def run_training(cfg: PolicyTrainConfig) -> int:
                 batch = train_utils.process_namedtuple_batch(batch, cfg.device)
                 if cfg.mode == "xdiffusion":
                     timesteps = torch.randint(low=0, high=cfg.num_train_timesteps, size=(batch.label.shape[0],), device=cfg.device).long()
-                    logits = classifier.unified_forward(batch, timesteps=timesteps)
+                    cls_sc = batch.state_cond[:, -1:, :]
+                    if cfg.use_interferer:
+                        cls_sc = cls_sc[..., :7]
+                    cls_batch = batch._replace(state_cond=cls_sc)
+                    logits = classifier.unified_forward(cls_batch, timesteps=timesteps)
                     probabilities = torch.sigmoid(logits.squeeze(-1))
                     if not torch.isfinite(probabilities).all():
                         raise RuntimeError("Non-finite classifier probabilities during X-Diffusion validation")
-                    loss_masks, mask_stats = compute_xdiffusion_loss_masks(batch, probabilities, cfg.threshold)
+                    loss_masks, mask_stats = compute_xdiffusion_loss_masks(batch, probabilities, cfg.threshold,
+                                                                       vis_force=cfg.vis_force_admission)
                     if mask_stats["robot_included"] != mask_stats["robot_total"]:
                         raise RuntimeError("Robot actions were not all included in X-Diffusion validation loss")
                     if cfg.grasp_dim_robot_only:
@@ -571,6 +620,7 @@ def run_training(cfg: PolicyTrainConfig) -> int:
                 {
                     "human_total": epoch_masking["human_total"],
                     "human_included": epoch_masking["human_included"],
+                    "human_vis_forced": epoch_masking["human_vis_forced"],
                     "robot_total": epoch_masking["robot_total"],
                     "robot_included": epoch_masking["robot_included"],
                     "timestep_min": timestep_min,
@@ -584,15 +634,20 @@ def run_training(cfg: PolicyTrainConfig) -> int:
             masking_rows.append(dict(row))
         with metrics_path.open("a") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+        if wb is not None:
+            wb.log({k: v for k, v in row.items() if isinstance(v, (int, float, bool))},
+                   step=epoch_idx)
 
     train_utils.plot_losses(train_epoch_losses, val_epoch_losses, str(run_dir))
+    if wb is not None:
+        wb.finish()
     latest_ckpt = run_dir / "checkpoints" / "latest.pth"
     if not latest_ckpt.exists():
         raise RuntimeError("Checkpoint save failed: latest.pth not found")
 
     reloaded_policy = instantiate_policy(
         action_dim=train_loader.dataset.action_dim,
-        state_cond_dim=train_loader.dataset.state_cond_dim,
+        state_cond_dim=train_loader.dataset.state_cond_dim // cfg.obs_horizon,
         num_points=dataset_cfg.num_points,
         cfg=cfg,
     )

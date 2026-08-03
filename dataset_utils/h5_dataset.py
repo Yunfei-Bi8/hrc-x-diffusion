@@ -101,6 +101,20 @@ class H5DatasetConfig:
     
     # Balanced sampling settings
     balanced_sampling_weights: Optional[tuple] = (0.5, 0.5)
+    # PATCH (2026-07-24, HRC): append per-frame interferer features to state_cond.
+    # H5 key "interferer" (T,4) = [cx_px, cy_px, vis, dist_px] (camera_01 2D, MT-pi
+    # HRC precedent); files WITHOUT the key (robot / 25-06 human) get sentinel rows
+    # (0,0,0,1500). action stays 7-dim; state_cond becomes 11-dim.
+    use_interferer: bool = False
+    interferer_oversample_factor: float = 1.0
+    # Closed-phase negative-condition dropout (handover): windows whose grasp dim is
+    # CLOSED throughout get the interferer swapped to the sentinel with this prob.
+    # Manufactures the data-absent counterfactual "holding + no receiver -> keep
+    # holding" so release is attributable to the condition (the receiver is visible in
+    # ~all recorded hold frames, so without this the model learns to ignore it —
+    # measured: full-chunk release 72% REAL vs 72% SENTINEL). Release-transition
+    # windows always keep the real features.
+    interferer_neg_dropout: float = 0.0
     # PATCH (2026-07-23): oversample windows whose ACTION grasp dim contains an
     # open<->close transition. Grasp initiation is a rare event (~1-2% of windows);
     # without boosting, the policy learns the copy-through shortcut (output grasp =
@@ -292,6 +306,11 @@ class H5Dataset(torch.utils.data.Dataset):
                 g = self.train_data["action"][dataset_type][local_idx][:, -1]
                 if (g[1:] != g[:-1]).any():
                     weight *= boost
+            iboost = float(getattr(self.cfg, "interferer_oversample_factor", 1.0) or 1.0)
+            if iboost > 1.0 and getattr(self.cfg, "use_interferer", False):
+                sc = self.train_data["state_cond"][dataset_type][local_idx]
+                if sc.shape[-1] >= 11 and (sc[:, 9] > 0.5).any():   # vis column
+                    weight *= iboost
             sample_weights.append(weight)
         return torch.tensor(sample_weights, dtype=torch.float32)
 
@@ -310,6 +329,20 @@ class H5Dataset(torch.utils.data.Dataset):
         action = self.train_data["action"][dataset_type][local_idx]
         state_cond = self.train_data["state_cond"][dataset_type][local_idx]
         data_type = self.train_data["data_type"][dataset_type][local_idx]
+
+        p_neg = float(getattr(self.cfg, "interferer_neg_dropout", 0.0) or 0.0)
+        # v3: dropout applies to ALL transition-free windows (constant grasp dim), not
+        # just closed ones — the demos have the receiver hovering visible during ~all
+        # of the descent (robot 68% / human 91%), so "descend with NO receiver" had no
+        # support and the deployed policy hesitated at z~0.54 (measured 15s plateau,
+        # sentinel throughout). Task-truthful: the robot grasps first regardless of the
+        # receiver. Transition windows always keep the real condition (release causality).
+        if (p_neg > 0.0 and getattr(self.cfg, "use_interferer", False)
+                and state_cond.shape[-1] >= 11
+                and float(np.max(action[:, 6]) - np.min(action[:, 6])) < 0.5
+                and np.random.random() < p_neg):
+            state_cond = state_cond.copy()
+            state_cond[..., 7:] = np.array([0.0, 0.0, 0.0, 1500.0], np.float32)
 
         # Normalize the data
         action = normalize_data(action, self.stats["action"])
@@ -468,6 +501,17 @@ class H5Dataset(torch.utils.data.Dataset):
 
         # Build state conditioning data
         state_cond_data = action_data
+        if getattr(self.cfg, "use_interferer", False):
+            T_len = action_data.shape[0]
+            interferer = None
+            with h5py.File(physical_file, 'r') as f:
+                if "interferer" in f:
+                    interferer = np.array(f["interferer"], dtype=np.float32)
+            if interferer is None or interferer.shape[0] != T_len:
+                interferer = np.tile(np.array([0.0, 0.0, 0.0, 1500.0], np.float32),
+                                     (T_len, 1))
+            state_cond_data = np.concatenate(
+                [action_data.astype(np.float32), interferer], axis=1)
         # Load image data if configured
         episode_image_data = None
         if self._load_images and self._camera_views and agent1_images is not None:

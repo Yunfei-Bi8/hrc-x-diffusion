@@ -58,6 +58,8 @@ class ClassifierTrainConfig:
     add_noise_to_sample: bool = True
     add_noise_to_state_cond: bool = True
     threshold: float = 0.5
+    use_interferer: bool = False
+    interferer_oversample_factor: float = 1.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -246,6 +248,8 @@ def run_training(cfg: ClassifierTrainConfig) -> int:
         pred_horizon=cfg.pred_horizon,
         action_horizon=cfg.action_horizon,
         balanced_sampling_weights=tuple(cfg.balanced_sampling_weights),
+        use_interferer=cfg.use_interferer,
+        interferer_oversample_factor=cfg.interferer_oversample_factor,
     )
     physical_paths = [str(dataset_dirs["robot"]), str(dataset_dirs["human"])]
     dataloader_kwargs = dict(

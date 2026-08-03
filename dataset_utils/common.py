@@ -296,7 +296,14 @@ def make_dataset(
         valid_starts_max = episode_end - pred_horizon - obs_horizon - 1
         for valid_start in range(valid_starts_min, valid_starts_max + 1):
             valid_end = valid_start + pred_horizon + obs_horizon - 1
-            train_data["state_cond"].append(state_cond_data[valid_start:valid_start+obs_horizon])
+            # obs_horizon>1: valid_start can be episode_start-(obs_horizon-1); clamp the
+            # slice and left-pad by repeating the first frame (standard diffusion-policy
+            # start padding). No-op for obs_horizon=1 (valid_start >= episode_start).
+            _obs = state_cond_data[max(episode_start, valid_start):valid_start + obs_horizon]
+            if len(_obs) < obs_horizon:
+                _obs = np.concatenate(
+                    [np.repeat(_obs[:1], obs_horizon - len(_obs), axis=0), _obs], axis=0)
+            train_data["state_cond"].append(_obs)
             if delta_actions:
                 actions = make_delta_actions(
                     action_data[valid_start+obs_horizon-1:valid_start+pred_horizon+obs_horizon],
