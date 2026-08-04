@@ -75,6 +75,8 @@ class PolicyTrainConfig:
     # there vis is ~saturated (94%) and forcing would disable gating wholesale.
     vis_force_admission: bool = True
     interferer_neg_dropout: float = 0.0
+    neg_dropout_scope: str = "transition_free"
+    neg_dropout_still_mm: float = 12.0
     interferer_oversample_factor: float = 1.0
     use_wandb: bool = False
     wandb_project: str = "x-diffusion-hrc"
@@ -417,6 +419,8 @@ def run_training(cfg: PolicyTrainConfig) -> int:
         use_interferer=cfg.use_interferer,
         interferer_oversample_factor=cfg.interferer_oversample_factor,
         interferer_neg_dropout=cfg.interferer_neg_dropout,
+        neg_dropout_scope=cfg.neg_dropout_scope,
+        neg_dropout_still_mm=cfg.neg_dropout_still_mm,
     )
     physical_paths = [str(dataset_dirs["robot"])]
     human_source = get_human_source_embodiment(cfg)

@@ -115,6 +115,15 @@ class H5DatasetConfig:
     # measured: full-chunk release 72% REAL vs 72% SENTINEL). Release-transition
     # windows always keep the real features.
     interferer_neg_dropout: float = 0.0
+    # dropout scope: which transition-free windows are eligible for the sentinel swap.
+    #  "transition_free" (default = existing behavior): any constant-grasp window
+    #  "closed"          : closed windows only (the original v2 recipe)
+    #  "closed_or_still" : closed OR (open AND net displacement < neg_dropout_still_mm)
+    #                      — for REACTIVE tasks: waiting windows learn "sentinel->hold"
+    #                      while moving-open (approach) windows keep the real condition,
+    #                      so the approach stays attributable to the condition.
+    neg_dropout_scope: str = "transition_free"
+    neg_dropout_still_mm: float = 12.0
     # PATCH (2026-07-23): oversample windows whose ACTION grasp dim contains an
     # open<->close transition. Grasp initiation is a rare event (~1-2% of windows);
     # without boosting, the policy learns the copy-through shortcut (output grasp =
@@ -337,10 +346,20 @@ class H5Dataset(torch.utils.data.Dataset):
         # support and the deployed policy hesitated at z~0.54 (measured 15s plateau,
         # sentinel throughout). Task-truthful: the robot grasps first regardless of the
         # receiver. Transition windows always keep the real condition (release causality).
-        if (p_neg > 0.0 and getattr(self.cfg, "use_interferer", False)
-                and state_cond.shape[-1] >= 11
-                and float(np.max(action[:, 6]) - np.min(action[:, 6])) < 0.5
-                and np.random.random() < p_neg):
+        _elig = False
+        if p_neg > 0.0 and getattr(self.cfg, "use_interferer", False) and state_cond.shape[-1] >= 11:
+            _const = float(np.max(action[:, 6]) - np.min(action[:, 6])) < 0.5
+            if _const:
+                _scope = str(getattr(self.cfg, "neg_dropout_scope", "transition_free"))
+                _closed = float(np.max(action[:, 6])) < 0.5
+                if _scope == "closed":
+                    _elig = _closed
+                elif _scope == "closed_or_still":
+                    _still = float(np.linalg.norm(action[-1, :3] - action[0, :3])) * 1000.0 <                         float(getattr(self.cfg, "neg_dropout_still_mm", 12.0) or 12.0)
+                    _elig = _closed or _still
+                else:
+                    _elig = True
+        if _elig and np.random.random() < p_neg:
             state_cond = state_cond.copy()
             state_cond[..., 7:] = np.array([0.0, 0.0, 0.0, 1500.0], np.float32)
 
