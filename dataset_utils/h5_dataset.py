@@ -361,7 +361,9 @@ class H5Dataset(torch.utils.data.Dataset):
                     _elig = True
         if _elig and np.random.random() < p_neg:
             state_cond = state_cond.copy()
-            state_cond[..., 7:] = np.array([0.0, 0.0, 0.0, 1500.0], np.float32)
+            _w = state_cond.shape[-1] - 7
+            _sent = np.array([0.0, 0.0, 0.0, 1500.0] + [0.5] * max(0, _w - 4), np.float32)
+            state_cond[..., 7:] = _sent[:_w]
 
         # Normalize the data
         action = normalize_data(action, self.stats["action"])
