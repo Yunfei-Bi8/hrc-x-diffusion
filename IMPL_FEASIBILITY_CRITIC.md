@@ -115,6 +115,29 @@ run dir; report ECE before/after. Consumers:
 - **Soft admission weight**: `w = P_feas(A^k, s, k)^γ` replacing the hard
   `1{k ≥ k*}` gate in `compute_xdiffusion_loss_masks()`.
 
+### 1.4a CRITICAL BUG FOUND (2026-08-07): the classifier's `HalfUnet1D` never
+saw `state_cond` — `cond *= 0` in `models/policy_nets/unet.py` (upstream
+"Public release" commit, confirmed via `git log -L`) zeroed the conditioning
+tensor before concatenation, for every classifier built on `HalfUnet1D`
+(the policy's `ConditionalUnet1D` does not have this line and is unaffected).
+Empirically verified: with RNG frozen so only `state_cond` varies, logits
+were bit-identical (max abs diff 0.0) before the fix, and diverge (max abs
+diff 7.0 on a synthetic probe) after removing the line. **Practical
+consequence**: `c_θ(k, A_t^k, s_t)` in the paper's own Eq. 2 was actually
+`c_θ(k, A_t^k)` in this codebase the whole time — every classifier we've
+trained (including `classifier_handover_uni`, used in the §0 pilot) never
+used proprioception. This explains why signal on teleport/whipsaw/jitter was
+possible at all despite the bug (those corruptions are visible through the
+action tensor `A` itself, not through `s`) but forecloses any
+state-vs-action relationship check (e.g. "does this predicted chunk start
+near the arm's actual current pose", workspace-boundary proximity) until
+fixed. **Fixed**: the `cond *= 0` line is removed. **Breaking**: any
+classifier checkpoint trained before the fix must be RETRAINED, not just
+reloaded — its FiLM layers' weights for the state-derived channels of
+`global_feature` were only ever trained against an all-zero input, so
+unzeroing at inference injects effectively untrained noise into those
+channels.
+
 ### 1.4 Is the architecture sufficient? (added after 08-06 review)
 
 The honest three-layer verdict on "can a 7-DoF-input HalfUnet tell feasibility":
@@ -268,6 +291,15 @@ ample for a ~20M-param trunk that already trains on 50k+ windows.
 
 ## 3. Code changes (file-level)
 
+**Status (2026-08-07): items 0 and 3(partial) below are IMPLEMENTED and
+smoke-tested** (variable window length T∈{8,24}, with/without finger stream,
+forward + masked multitask loss, deploy-mode no-finger path — all pass).
+Not yet wired: corruption loader hook, IK screen, calibration, deploy
+integration, and no retraining has happened yet.
+
+0. `models/policy_nets/unet.py` — **DONE**: removed the `cond *= 0` line in
+   `HalfUnet1D.forward` (see §1.4a). `ConditionalUnet1D` (the policy) was
+   unaffected and untouched.
 1. `dataset_utils/corruptions.py` (NEW, ~150 lines): pure functions
    `(chunk_raw, rng, magnitude) → chunk_raw`, family registry, `CorruptionConfig`
    (families, p_corrupt, magnitude ranges, curriculum flag). Unit test: each family
@@ -275,9 +307,22 @@ ample for a ~20M-param trunk that already trains on 50k+ windows.
 2. `dataset_utils/h5_dataset.py`: hook corruption sampling immediately BEFORE
    `normalize_data` in `__getitem__`; emit `(sample, head_labels, head_mask)`;
    per-head balanced sampler.
-3. `models/xdiffusion/hr_classifier.py`: `FeasibilityCritic(HumanRobotClassifier)`
-   with `Linear(1024, 3)`, `loss_multitask()` (masked BCE), backward-compatible
-   single-head checkpoint migration (key remap for the old `classifier.2` weight).
+3. `models/xdiffusion/hr_classifier.py` — **DONE (implementation differs
+   slightly from the original sketch, in a better direction)**: added
+   `DualPool1D`, `FingerBranchEncoder`, `FeasibilityCriticConfig`,
+   `FeasibilityCritic` as new ADDITIVE classes (composition over the
+   existing `HalfUnet1D`, not subclassing `HumanRobotClassifier` — cleaner
+   than the originally-sketched checkpoint-migration approach; old
+   identity-only checkpoints keep loading unchanged into `HumanRobotClassifier`).
+   `FeasibilityCritic.heads = Linear(fused_dim, 3)` where `fused_dim` =
+   dual-pooled 7-DoF trunk (§1.4 Layer 2 item 1, folded in directly) +
+   optional dual-pooled finger branch with a learned `no_finger_token` for
+   modality dropout (§1.4 Layer 3) — both upgrades implemented in the same
+   pass rather than as separate later edits. `forward()` is agnostic to `T`
+   (fully convolutional + pooled), so the §1.4 Layer 2 window-decoupling
+   item (24-step training / 16+8 deploy) needs NO further model code —
+   confirmed by smoke-testing T=8 and T=24 through the same module.
+   `loss_multitask()` does per-head masked BCE per §1.2.
 4. `scripts/ik_screen.py` (NEW): v1 = EEF-space screen (workspace box incl. table
    clearance, per-step velocity/accel vs our deploy limits, orientation
    reachability heuristic); v1.1 = closed-form UR10e IK, joint-branch continuity +
@@ -409,6 +454,149 @@ ground-truth labels instead of eyeballed side-grasp examples, and is the
 quantitative object that did not exist before.
 
 ---
+
+## 4.9 EXECUTED — synthetic-negative validation results (2026-08-07)
+
+`scripts/feascritic_synth_exp.py`, data = handover_bowl_uni (the h5 exports of
+29-07-two-human + 07-29-rf/hf-handover; 10,976 train / 453 val 24-step windows,
+episode-disjoint). Measured envelope: |Δp|/step p99 = 9.9 mm, euler-rate p99 =
+0.128 rad/step. 7 kin families (0% envelope-pass = guaranteed violations) + 3
+afford families (100% envelope-pass after gen-filter = kinematically clean) +
+synth-transport positive control sharing the synthesis machinery. 5 runs × 3000
+steps: main / blind (state zeroed) / channel (state ⊕ input channels) / LOFO
+(teleport+whipsaw held out) / LOTO (cap_twist held out).
+
+**Affordance head — validated, strongly.** AUROC@k=0: pen_spin 0.968, cap_twist
+1.000, gather 0.979. **LOTO: cap_twist NEVER TRAINED → 0.998** — the concept
+transfers across generator families. Dissociation clean both ways: afford head
+on kin corruptions ≤0.51 (no false firing); kin head on afford negatives
+0.001–0.27 (scores them kinematically "hyper-feasible", correct — they are
+quasi-static and in-envelope). Anti-shortcut controls hold: synth_transport
+scores feasible on both heads (kin P 0.86, aff P 0.94); still-control passes
+(0.89/0.94); real euler spans (6.28/2.9/6.24 rad) cover synthetic amplitudes.
+
+**Kinematic head — 4/7 strong, 3 weak with understood causes.** AUROC@k=0
+(main→channel): speed 0.949→0.966, whipsaw 0.981→0.987, euler_rate 0.998,
+flutter_fast 1.000 — vs the identity classifier's 0.49–0.55 on the same axes
+(08-06 pilot): the missing-supervision diagnosis confirmed. Weak: teleport
+0.696→0.748, jitter 0.593→0.643, start_jump 0.735→**0.949 (channel)**.
+
+Three root causes, each evidenced:
+1. **FiLM cannot do state–action comparison**: blind ≈ main on start_jump
+   (0.723 vs 0.735) — even unblocked, the FiLM path goes unused; concatenating
+   the state as extra INPUT CHANNELS (action_dim 7→14, `--state-channel`) is
+   what operationalizes it (0.949). → ADOPTED as the §1.4 model modification.
+   (Also the honest refinement of §1.4a: the cond fix is necessary but NOT
+   sufficient.)
+2. **iid jitter is confounded with the forward-diffusion noise itself** — a
+   noise-conditioned critic is trained to look THROUGH additive iid Gaussian
+   perturbations; violations that mimic the noising distribution are its
+   structural blind spot. Partial fix: low-k importance sampling (at k=0 the
+   model knows noise≈0, so observed jitter must be data). Deploy-relevant
+   bursts are STRUCTURED (whipsaw 0.98+), so the practical impact is bounded.
+3. **Teleport signal exists only at low k** (a 40 mm jump drowns in ~100 mm/dim
+   DDPM noise by k≈20-40); uniform-k training dilutes the pressure. Same low-k
+   sampling fix.
+
+**LOFO caveat**: held-out whipsaw transfers poorly (0.981 trained → 0.595
+held-out) — the kin families as currently designed do not yet induce one
+general "continuity violation" concept; broaden family diversity + magnitude
+curriculum before claiming operator-independence.
+
+Identity head sanity: preserved (mean P clean_robot 0.87 vs clean_human 0.02).
+k-profiles decay as the ambient premise predicts (cap_twist holds 1.000 to
+k=40; whipsaw 0.98→0.68).
+
+**Gate verdict: GO.** Both target discriminations demonstrated on the real
+handover data + synthetic negatives; the state-channel variant is the adopted
+architecture; jitter/teleport weaknesses have understood causes and a concrete
+training-recipe fix; the real-collection E2 remains the true affordance test.
+
+## 4.10 EXECUTED — deployment-domain validation (2026-08-07, round 2)
+
+Answers three challenges raised against §4.9: (a) is noise-step training even
+right for a deployment-only shield? (b) policy-GENERATED chunks differ from
+data windows — does discrimination survive? (c) more structure changes needed?
+
+**E-A, k-sampling ablation** (train-k ∈ {uniform, zero, low}, all
+state-channel): uniform-k training was exactly the weakness — at the shield's
+operating point (k=0), k=0-only / low-k training lifts teleport 0.748→0.979 /
+0.970 and jitter 0.643→0.994/0.990, everything ≥0.97 (afford ≥0.999).
+**Verdict: for the deployment shield, train at k≈0; the noise axis is only
+needed when the same critic also serves training-time admission.** Two-regime
+answer; low-k (50% k=0 + 50% U[0,21)) is the adopted default (`klow`).
+
+**E-B, real-policy tests** (uni_v3, the actually-deployed policy;
+[16 executed ‖ 8 generated] composite windows = the deploy scoring shape):
+- *Cell 1*: generated vs real-continuation composites are INDISTINGUISHABLE
+  to the critic (texture-AUROC 0.498-0.501); good outputs pass 94-96% at the
+  95%-TPR-on-real threshold. No generation-texture penalty exists.
+- *Cell 3 vs 4 (attribution)*: corruption-detection drop on generated chunks
+  (0.97-0.99 → 0.61-0.88) is reproduced EXACTLY on real windows when the
+  corruption is confined to the last-8 slice → cause = slice-confinement
+  (training only used full-window corruptions), NOT policy texture. Fix =
+  `--corrupt-span mixed` (50% full / 25% suffix-8 / 25% random suffix):
+  `kmix` recovers generated-domain detection to 0.86-0.99 (teleport 0.91,
+  jitter 0.87, euler 0.96, flutter 0.99, whipsaw 0.98, seam_jump 0.95) while
+  keeping the full-window battery ≥0.97. Both fixes are TRAINING-RECIPE, not
+  architecture: no further model change needed beyond §4.9's state-channel.
+- *Cells 2/5 (honest negative)*: the 08-05 whipsaw does NOT reproduce
+  offline — open-loop burst rate 0.3%, and even 20-cycle closed-loop
+  anchor-following rollouts drift smoothly (jump p95 4.2 mm). The live
+  failure evidently required real-world condition flicker; robot A/B remains
+  the test for that scenario. Directional sensitivity is present:
+  corr(peak |Δp|, P_kin) = −0.354 across rollouts.
+
+**E-C, laundering test**: a policy trained PURELY on synthetic
+affordance-infeasible episodes (28 pen-spin + 16 cap-twist), then sampled:
+its own generated chunks score P_aff 0.244 (data windows 0.311; uni_v3
+feasible-policy outputs 0.902) — **signatures are NOT laundered by
+diffusion-policy learning + DDIM sampling** (euler churn even amplified,
+0.0085→0.0235 rad/step; grasp cycles slightly attenuated 0.44→0.31
+transitions/chunk but present). Single-chunk veto at P_aff<0.5: 76.4%
+(contaminated) vs ~0% (feasible policy); M-of-N cycle logic pushes sustained
+behavior to ~certain veto. P_kin stays 0.995 on both — the dissociation
+holds in the deployment domain.
+
+Artifacts: `runs/feascritic_synth/{kzero,klow,kmix}.json`, `eb_deploy.json`,
+`ec_contam.json`; contaminated policy `runs/policy_feas_contam`.
+**Adopted recipe: state-channel + low-k training + mixed-span corruptions
+(= the `kmix` configuration).**
+
+## 4.11 EXECUTED — jar-lid-opening zero-shot probe (2026-08-10)
+
+Proposed first real collection: hand-1 unscrews a jar lid (retargeted action),
+hand-2 holds the jar (condition-only; invisible to the critic). Probe: four
+synthetic proxies of the REAL motion, deliberately different from the trained
+cap_twist family (sawtooth work/return strokes, open-on-return, roll/pitch
+wobble, progressive z-rise, finger-walk periods, final lift-off), scored by
+the FROZEN kmix critic — no retraining:
+
+| style | AUROC (relevant head) | either-head veto |
+|---|---|---|
+| tight-lid twist-regrasp loop | afford **1.000** (kin silent — correct) | 100% |
+| + HaMeR-level tracking noise (3 mm / 0.03 rad) | afford **1.000** | 100% |
+| loose-lid finger-walk (period 6-9) | afford **1.000** | 100% |
+| fast fingertip spin (period 2-4) | kin 0.706 + afford 0.773 (bandwidth band → kin territory, as designed) | 96.4% |
+| final lid-LIFT phase (executable) | passes both | 3.6% (≈ the 5% design FPR) |
+
+The heads PARTITION the style space as designed, and the critic is
+phase-precise within the task: unscrew segments flagged, the genuinely
+executable lift-off passes — the §3 segment-masked-co-training story
+demonstrated zero-shot. Jar-opening is confirmed as the #1 collection
+candidate: (i) it sits in the strongest-validated signature class
+(grasp-oscillation-while-holding + rotation phase-lock); (ii) the
+infeasibility argument is airtight from trace semantics alone —
+**release-while-must-hold**: fingers keep the lid controlled during a
+regrasp, the retargeted binary gripper "open" drops it — effectiveness
+failure, no kinematic-limit hand-waving needed; (iii) trace-VISIBLE, so no
+finger branch required for v1; (iv) natural HRC framing (partner provides
+force closure = genuine collaboration; deploy demo = offer-jar → veto/decline
+vs open-palm → handover); (v) built-in feasible phase (lift) for the
+segment story. Collection notes: jar held between the two cameras (occlusion
+hygiene); instruct NATURAL unscrewing (fast fingertip spins land in the kin
+band instead — still vetoed, but attribution muddies); matched feasible set
+on the same scene (pick/place/hand-over the same jar); everything else per §2.
 
 ## 5. Reference papers
 

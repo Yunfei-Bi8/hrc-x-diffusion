@@ -1,12 +1,12 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 from termcolor import cprint
 
 from dataset_utils.common import H5Batch as Batch
-from models.policy_nets.unet import HalfUnet1D
+from models.policy_nets.unet import Conv1dBlock, Downsample1d, HalfUnet1D
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from common_utils.data_aug import RandomShiftsAug
 
@@ -212,6 +212,199 @@ class HumanRobotClassifier(nn.Module):
         logits = self.classifier(half_unet_features)
         
         return logits
+
+class DualPool1D(nn.Module):
+    """avg+max pooling over time, concatenated: (B,C,T) -> (B,2C).
+    Max-pool preserves single-frame peak violations (e.g. a teleport spike)
+    that global-average pooling dilutes by 1/T."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cat([x.mean(dim=-1), x.amax(dim=-1)], dim=-1)
+
+
+class FingerBranchEncoder(nn.Module):
+    """Lightweight temporal conv encoder over per-frame fingertip features
+    (5 tips x 3d relative to the wrist frame = 15-dim/frame), from the HaMeR
+    keypoints available upstream of retargeting. Only human data carries this
+    stream; robot rows and deployment have none (see branch-dropout below)."""
+
+    def __init__(self, input_dim: int = 15, down_dims: List[int] = [64, 128], kernel_size: int = 5, n_groups: int = 8):
+        super().__init__()
+        all_dims = [input_dim] + list(down_dims)
+        in_out = list(zip(all_dims[:-1], all_dims[1:]))
+        self.blocks = nn.ModuleList([
+            nn.ModuleList([
+                Conv1dBlock(dim_in, dim_out, kernel_size, n_groups=n_groups),
+                Conv1dBlock(dim_out, dim_out, kernel_size, n_groups=n_groups),
+                Downsample1d(dim_out) if i < len(in_out) - 1 else nn.Identity(),
+            ])
+            for i, (dim_in, dim_out) in enumerate(in_out)
+        ])
+        self.out_channels = down_dims[-1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B,T,15) -> (B,C,T')"""
+        x = x.moveaxis(-1, -2)
+        for block1, block2, down in self.blocks:
+            x = down(block2(block1(x)))
+        return x
+
+
+@dataclass
+class FeasibilityCriticConfig:
+    # Shared 7-DoF trunk (same as HumanRobotClassifierConfig)
+    half_unet_down_dims: List[int] = field(default_factory=lambda: [256, 512, 1024])
+    half_unet_kernel_size: int = 5
+    half_unet_n_groups: int = 8
+    half_unet_diffusion_step_embed_dim: int = 256
+    num_train_timesteps: int = 100
+    beta_schedule: str = "squaredcos_cap_v2"
+    clip_sample: bool = True
+    prediction_type: str = "epsilon"
+    add_noise_to_sample: bool = True
+    add_noise_to_state_cond: bool = True
+
+    # Optional finger branch (Layer 3, §1.4): set finger_dim=0 to disable
+    # entirely (pure 7-DoF critic, used for the E2 dual-input ablation and
+    # for the deployment shield, which never has finger data).
+    finger_dim: int = 15
+    finger_down_dims: List[int] = field(default_factory=lambda: [64, 128])
+    finger_branch_dropout_p: float = 0.5  # P(drop finger stream) during training
+
+    head_names: List[str] = field(default_factory=lambda: ["identity", "kin_feas", "afford_feas"])
+
+
+class FeasibilityCritic(nn.Module):
+    """Upgrades HumanRobotClassifier's single identity logit into three
+    per-head feasibility scores, per RESEARCH_PROPOSAL_FEASIBILITY.md /
+    IMPL_FEASIBILITY_CRITIC.md Design B. Additive: does not modify
+    HumanRobotClassifier, old identity-only checkpoints remain loadable
+    by that class unchanged.
+
+    NOTE (2026-08-07): requires the models/policy_nets/unet.py HalfUnet1D
+    `cond *= 0` fix (removed) to actually see state_cond -- verified by
+    direct probe that the un-patched HalfUnet1D was state-blind. Any
+    classifier checkpoint trained BEFORE that fix must be retrained, not
+    just reloaded: its FiLM weights for the state-conditioning channels
+    were never trained against a non-zero signal.
+    """
+
+    def __init__(
+        self,
+        obs_horizon: int,
+        state_cond_dim: int,
+        action_dim: int,
+        cfg: FeasibilityCriticConfig,
+    ):
+        super().__init__()
+        self.obs_horizon = obs_horizon
+        self.cfg = cfg
+        self.head_names = cfg.head_names
+
+        self.half_unet = HalfUnet1D(
+            input_dim=action_dim,
+            cond_dim=state_cond_dim,
+            obs_horizon=obs_horizon,
+            diffusion_step_embed_dim=cfg.half_unet_diffusion_step_embed_dim,
+            down_dims=cfg.half_unet_down_dims,
+            kernel_size=cfg.half_unet_kernel_size,
+            n_groups=cfg.half_unet_n_groups,
+        )
+        self.pool = DualPool1D()
+        fused_dim = cfg.half_unet_down_dims[-1] * 2  # avg+max
+
+        self.use_fingers = cfg.finger_dim > 0
+        if self.use_fingers:
+            self.finger_encoder = FingerBranchEncoder(
+                input_dim=cfg.finger_dim, down_dims=cfg.finger_down_dims,
+                kernel_size=cfg.half_unet_kernel_size, n_groups=cfg.half_unet_n_groups,
+            )
+            self.finger_pool = DualPool1D()
+            finger_fused_dim = cfg.finger_down_dims[-1] * 2
+            # learned "no finger data" token (deploy has none; robot rows have
+            # none; branch-dropout during training teaches the heads to work
+            # both with and without it) -- modality-dropout, not literal skip.
+            self.no_finger_token = nn.Parameter(torch.zeros(finger_fused_dim))
+            fused_dim += finger_fused_dim
+
+        self.heads = nn.Linear(fused_dim, len(self.head_names))
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+        self.noise_scheduler = DDPMScheduler(
+            num_train_timesteps=cfg.num_train_timesteps,
+            beta_schedule=cfg.beta_schedule,
+            clip_sample=cfg.clip_sample,
+            prediction_type=cfg.prediction_type,
+        )
+
+    def add_noise_to_data(self, data: torch.Tensor, timesteps: Optional[torch.Tensor] = None):
+        noise = torch.randn(data.shape, device=data.device)
+        if timesteps is None:
+            timesteps = torch.randint(0, self.cfg.num_train_timesteps, (data.shape[0],), device=data.device).long()
+        return self.noise_scheduler.add_noise(data, noise, timesteps), timesteps
+
+    def forward(
+        self,
+        batch: Batch,
+        timesteps: Optional[torch.Tensor] = None,
+        finger_present: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        batch.action: (B,T,action_dim) -- T is whatever window length the
+            caller trained/scores with (24-step training window, 8-step
+            policy chunk, 16+8 history+chunk at deploy -- all valid, the
+            trunk is fully convolutional + pooled, no shape coupling).
+        batch.state_cond: (B,obs_horizon,state_cond_dim)
+        batch.finger (optional): (B,T,finger_dim) human-only fingertip stream.
+        finger_present (optional): (B,) bool, default = batch.finger is not None.
+        Returns logits (B, n_heads) in self.head_names order.
+        """
+        B = batch.action.shape[0]
+        noisy_sample, timesteps = self.add_noise_to_data(batch.action, timesteps=timesteps)
+        noisy_state = batch.state_cond
+        if self.cfg.add_noise_to_state_cond:
+            noisy_state, _ = self.add_noise_to_data(noisy_state, timesteps=timesteps)
+        state_flat = noisy_state.reshape(B, -1)
+
+        feat = self.half_unet(sample=noisy_sample, timestep=timesteps, cond=state_flat)
+        fused = self.pool(feat)
+
+        if self.use_fingers:
+            fingers = getattr(batch, "finger", None)
+            present = finger_present
+            if present is None:
+                present = torch.ones(B, dtype=torch.bool, device=fused.device) if fingers is not None \
+                    else torch.zeros(B, dtype=torch.bool, device=fused.device)
+            if self.training and self.use_fingers:
+                drop = torch.rand(B, device=fused.device) < self.cfg.finger_branch_dropout_p
+                present = present & ~drop
+            finger_feat = self.no_finger_token.expand(B, -1).clone()
+            if fingers is not None and present.any():
+                noisy_fingers, _ = self.add_noise_to_data(fingers, timesteps=timesteps)
+                pooled = self.finger_pool(self.finger_encoder(noisy_fingers))
+                finger_feat = torch.where(present.unsqueeze(-1), pooled, finger_feat)
+            fused = torch.cat([fused, finger_feat], dim=-1)
+
+        return self.heads(fused)  # (B, n_heads)
+
+    def loss_multitask(self, batch: Batch, timesteps: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """batch.labels: Dict[str, Tensor(B,)], batch.label_mask: Dict[str, Tensor(B,) bool]
+        (identity is assumed always-defined; kin/afford carry a mask since
+        e.g. a synthetic-corruption sample has kin=0 but no afford label).
+        timesteps: optional explicit noise steps — lets the trainer control the
+        k-sampling distribution (uniform / low-k-weighted / k=0-only)."""
+        logits = self.forward(batch, timesteps=timesteps)
+        losses, total = {}, 0.0
+        for i, name in enumerate(self.head_names):
+            y = batch.labels[name].float()
+            mask = batch.label_mask.get(name, torch.ones_like(y, dtype=torch.bool))
+            per_sample = self.bce(logits[:, i], y) * mask.float()
+            head_loss = per_sample.sum() / mask.float().sum().clamp(min=1.0)
+            losses[name] = head_loss
+            total = total + head_loss
+        losses["total"] = total
+        return losses
+
 
 @dataclass
 class ImageHumanRobotClassifierConfig:
