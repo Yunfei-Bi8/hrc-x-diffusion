@@ -225,10 +225,32 @@ network's time axis**:
   original paper's semantics (Fig. 3-style visualizations, "indistinguishability step")
   carry over verbatim to deployment plots.
 
-Testable predictions (offline replay): (P1) distilled DTE closes the sequential
-stability gap toward the discriminator's 1/34; (P2) per-chunk veto power closes
-88.4% -> ~91.5% @ 1% FA; (P3) k*-vs-t-hat correlation rises from 0.88 toward ~1 on the
-source task without hurting cross-task acceptance.
+Testable predictions and MEASURED OUTCOMES (offline replay, 2026-08-20; within-run
+baselines, since eval pools grew with the 08-18/19 sessions — plain vs distilled trained
+and evaluated identically in one script, teacher labels on 5,449 unlabeled source chunks):
+
+- **Axis calibration (the core "calibrate the noise step" goal): CONFIRMED.** Distillation
+  moves the student's scale onto the teacher's k-axis: rotation t-hat median 7.1 -> **49.4**
+  (teacher k* median 44), while feasible calibration scores stay low (q99 0.26 -> 0.76).
+  The absolute separation margin widens ~2.4x; the student now *reads in k\* units*.
+- **P1 (sequential stability): partially confirmed.** e-detector feasible-stream FA
+  12/40 -> **7/40** (-42%); slow-rotation sequential detection reaches teacher level:
+  miss 17% -> **1%**, delay 5 -> **2 cycles** (teacher: 2 cycles / 10% miss). Gap to the
+  teacher's FA level remains.
+- **P2 (per-chunk veto power): not confirmed.** 86.4% unchanged @ 1% FA (teacher 91.5%) —
+  distillation reshapes margins, not the alpha=1% ROC point.
+- **P3 as originally stated: refuted, metric was ill-chosen.** Spearman rho is
+  scale-invariant, and ranks barely move (0.763 -> 0.766). The intended goal behind P3 is
+  the axis calibration above, which succeeded; rank refinement would need a ranking loss,
+  not MSE.
+- **Cross-task acceptance preserved:** jar-distilled student still accepts handover
+  executed chunks at 1.3% ~= alpha.
+
+Net: the interaction is real and useful — the teacher transfers its *scale and margins*
+into the foil-free student (sequential slow-rotation closes to teacher level, sequential
+FA halves), while the per-chunk operating point and ranking remain student-limited.
+Artifacts: `scripts/dte_distillation.py`, checkpoint `kstar_uni/dte_distilled.pth`
+(lam=1.0; NOT deployed — deployed shield remains dte_oneclass.pth).
 
 Secondary interactions (mention, not headline): the discriminator as **curator** of the
 student's feasible corpus (k* <= tau filter replacing the heuristic euler filter);
