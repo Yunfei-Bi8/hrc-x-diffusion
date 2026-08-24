@@ -233,4 +233,4 @@ k\* path is untouched — swap back by pointing `--shield-run` at `kstar_cls.pth
 - Vincent. A Connection Between Score Matching and Denoising Autoencoders. 2011.
 - Vovk. Conformal test martingales for change-point detection. COPA 2021.
 - Angelopoulos, Bates et al. Learn then Test: calibrating predictive algorithms. AOAS 2025.
-- Chen et al. X-Diffusion: Training Diffusion Policies on Cross-Embodiment Human Demonstrations. 2025.
+- Pace et al. X-Diffusion: Training Diffusion Policies on Cross-Embodiment Human Demonstrations. ICRA 2026, arXiv:2511.04671.

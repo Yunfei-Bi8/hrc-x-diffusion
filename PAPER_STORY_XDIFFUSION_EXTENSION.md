@@ -1,294 +1,498 @@
-# Positioning: From Data Admission to Action Admission —
-# Extending X-Diffusion's Feasibility Criterion from Learning Time to Execution Time
+# Runtime Admission Control for Cross-Embodiment Diffusion Policies
+## The Full Paper Story (v2, 2026-08-24)
 
-*Story memo, 2026-08-20. Purpose: sell the DTE feasibility shield as a genuine
-EXTENSION of X-Diffusion, not a combination of two methods.*
+*This version supersedes the 2026-08-20 memo (v1 remains in git history). It integrates the
+2026-08-24 four-thread literature research: verified lineage (Ambient Omni → Ambient
+Diffusion Policy → X-Diffusion), corrected citations, scoped novelty claims, the final
+narrative skeleton, and the venue plan.*
+
+Companion documents:
+- `SAFETY_LAYER_MATH_FULL.md` — rigorous notation + full proofs (P1, L1–L4, T1–T5, A1).
+  Theorem numbers cited below refer to that file.
+- `README_TUM_DTE_FEASIBILITY.md` — deployed-system mechanics and deploy command.
+- `README_TUM_FEASIBILITY_SHIELD.md`, `README_TUM_JAR_UNIFIED.md` — hardware session records.
 
 ---
 
-## 1. The unifying mathematical object (why this is one method, not two)
+## 0. The story in one paragraph
 
-X-Diffusion's entire mechanism lives on one axis: the **forward-diffusion noise ladder**
-of the action space. Define the noise-indexed likelihood family ("diffusion scale-space")
-of the robot action distribution:
+A whole lineage of diffusion-model training methods — Ambient Diffusion Omni (NeurIPS 2025),
+Ambient Diffusion Policy (Tedrake lab, 2026), and X-Diffusion (Pace et al., ICRA 2026) — rests
+on a single quantity: the minimal forward-diffusion noise level at which a data point becomes
+statistically indistinguishable from the target distribution. Each of these papers computes
+this quantity with a noise-conditional classifier, uses it to decide **which data may enter
+training**, and then discards the classifier; Ambient Diffusion Policy's project page states
+it outright: *"Inference: no changes."* We name this quantity the **admission time**, and we
+show that the criterion these methods enforce at the entrance of the policy's lifecycle is
+still needed at its exit: a trained cross-embodiment policy remains a stochastic sampler that
+**re-emits embodiment-infeasible actions at execution** (measured: 12/12 unshielded rollouts),
+and the training-time alternative — deleting the infeasible demonstrations — produces not
+safety but undefined behavior (measured: 25% physical penetration). We therefore extend
+admission control from training time to execution time: a **one-class diffusion time
+estimation (DTE) network** estimates each emitted action chunk's admission time without any
+negative data; the discarded classifier serves **exactly once more**, as a primary standard
+whose scale is distilled into the deployable estimator; and a **split-conformal layer** turns
+scores into vetoes with a finite-sample false-veto guarantee whose only free parameter is a
+user-chosen risk budget. Verified live on a UR10e in both modes of a human-robot jar-opening
+task, with preliminary transfer to a handover task by re-zeroing the calibration alone.
 
-    L_x(k) = p_R^(k)(x) = (p_R * N(0, sigma_k^2))(x),   k = 0..K
+**The one-sentence sell:** *we do not bolt a new safety monitor onto X-Diffusion; we complete
+its own admission-time criterion across the policy's lifecycle — the same test that decided
+which human actions could train the policy now decides which policy actions may reach the
+robot.*
 
-Both feasibility estimators are **readouts of this same family**:
+---
 
-| | X-Diffusion classifier (Eq. 2-3) | our DTE network |
-|---|---|---|
-| object read | p_R^(k) vs p_H^(k) (relative) | p_R^(k) alone (intrinsic) |
-| readout | k* = min{k : c_theta(k, A^k) >= 0.5} — the crossing point of the two smoothed densities | t-hat = posterior mean over k of p_R^(k)(x) — the noise level that best explains x |
-| foil | human dataset D_H | **the noise ladder itself** |
-| semantics | "minimum indistinguishability step" | "estimated diffusion time" |
+## 1. The lineage and the gap (why this is an extension, not a combination)
 
-Both define **feasibility as a diffusion admission time**: how much forward noise until
-this action is accounted for by the robot's distribution. The difference is only *what
-supplies the contrast*: X-Diffusion contrasts against the human dataset at each k; DTE
-contrasts the noise levels of the robot's own data against each other (a 101-way
-noise-level classification — contrastive estimation along the diffusion axis, in the
-NCE/TRE lineage; X-Diffusion's classifier is the same telescoping-bridge construction
-with the human data as the foil).
+### 1.1 Three papers, one object, all training-time-only (verified 08-24)
 
-**Empirical anchor (measured, jar task):** Spearman rank correlation between k* and
-t-hat across 1,649 real chunks: **rho = 0.765 overall, 0.881 within the discriminative
-range** (both floor at 0 on approach/executed pools; both elevate on rotation: k* med 44,
-t-hat med 7.1). Two estimators, one quantity. (`figures/e1_same_quantity.npz`)
+| Work | The object | Where it acts | At inference |
+|---|---|---|---|
+| Ambient Diffusion Omni — Daras et al., NeurIPS 2025 Spotlight, arXiv:2506.10038 | t_min = inf{t : time-conditional two-class classifier output crosses 0.5−eps} per sample; Thm 4.2 proves d_TV(P∗N(0,σ²I), Q∗N(0,σ²I)) ≤ d_TV(P,Q)·D/(2σ) | admits low-quality images into training only above t_min | nothing |
+| Ambient Diffusion Policy — Wei, Pfaff, Cohn, Dayı, Daskalakis, Daras, Tedrake, arXiv:2606.12365 | same t_min ("minimum amount of noise required to confuse the classifier") for suboptimal robot demos | admits suboptimal demos into IL training above t_min | project page, verbatim: **"Inference ✓ No changes"** |
+| X-Diffusion — Pace, Dan, Ning, Bhardwaj, Du, Duan, Ma, Kedia (Cornell), ICRA 2026, arXiv:2511.04671 | k*(A) = min{k : c_θ(k, A^k, s) ≥ 0.5}, "the earliest noise level where human actions are indistinguishable from robot actions" | admits retargeted human actions into the denoising loss only at k ≥ k* (their Eq. 3–4) | bare policy; classifier discarded |
 
-## 1.5 Mathematical foundations
+Three consequences for the narrative:
 
-Throughout, actions are chunk features $x \in \mathbb{R}^d$ (here $d=32$: 8 steps of
-chunk-relative euler + grip), and the forward process is the variance-preserving (VP)
-diffusion shared with the policy, $q(x_k \mid x_0) = \mathcal{N}\big(\sqrt{\bar\alpha_k}\,x_0,\ (1-\bar\alpha_k) I\big)$,
-with $\bar\alpha_0 \approx 1 > \bar\alpha_1 > \dots > \bar\alpha_K \approx 0$ (cosine schedule, $K=100$).
+1. **The object is the lineage's own.** We are not importing a foreign criterion; we are
+   naming one that appears in three papers ("admission time" as a *term* is our coinage —
+   none of the three names it; X-Diffusion's phrase is "the earliest noise level where …
+   indistinguishable"). Naming and completing a predecessor's implicit object is a standard,
+   legitimate extension-paper move.
+2. **The gap is explicit in their own words.** The strongest possible framing of our
+   contribution is handed to us by Ambient Diffusion Policy's "Inference: no changes" — the
+   entire lineage enforces admission at the entrance and leaves the exit unguarded.
+3. **Novelty must be scoped accordingly** (see §8): the admission-time object is prior art;
+   our claims are the execution-time enforcement, the one-class estimator + equivalence
+   theory, the anchoring distillation, and the conformal veto guarantee — plus hardware.
 
-### 1.5.1 The noise-indexed family is a Gaussian scale-space
+### 1.2 The reuse move has respectable ancestry
 
-For any distribution $p$ over actions, define its noised marginal at step $k$:
+- **Discriminator Rejection Sampling** (Azadi et al., ICLR 2019): the GAN discriminator — a
+  training-only apparatus — is reused at *sampling time* to correct the generator's
+  distribution, with an idealized exactness theorem followed by an honest practical
+  relaxation. Structurally our exact story shape.
+- **Valvano et al. 2021** (arXiv:2108.12280), verbatim: *"should we discard the
+  discriminator? … the life cycle of adversarial discriminators should not end after
+  training."* The lifecycle rhetoric has precedent.
+- **"Your Diffusion Model is Secretly a Zero-Shot Classifier"** (Li et al., ICCV 2023):
+  revealing a discriminative capability latent in an already-trained generative object is a
+  recognized story family.
 
-$$p^{(k)}(x) \;=\; \int p(x_0)\, \mathcal{N}\!\big(x;\ \sqrt{\bar\alpha_k}\,x_0,\ (1-\bar\alpha_k) I\big)\, dx_0 .$$
+---
 
-Writing $D_a$ for the dilation $ (D_a p)(x) = a^{-d} p(x/a)$, this is exactly
+## 2. Why execution-time enforcement is necessary (the hook — measured, not argued)
 
-$$p^{(k)} \;=\; \big(D_{\sqrt{\bar\alpha_k}}\, p\big) \,*\, \mathcal{N}\big(0,(1-\bar\alpha_k)I\big),$$
+Per control cycle, for a stochastic policy π and a monitor M:
 
-i.e. **a Gaussian scale-space of the action distribution** (up to the VP shrinkage
-$\sqrt{\bar\alpha_k}$): increasing $k$ blurs $p$ with a Gaussian of growing bandwidth
-$\sigma_k^2 = 1-\bar\alpha_k$ while contracting its support toward the origin. Both
-estimators below are functionals of the same family $\{p_R^{(k)}\}_{k=0}^{K}$, where
-$p_R$ is the distribution of feasible (robot-executed) chunks.
+    P(infeasible action is executed)
+        = P_π(infeasible action is emitted) × P_M(missed | emitted)
+          \_____ training-time gate _____/    \__ execution-time gate __/
+                 shapes this factor                bounds this factor
 
-### 1.5.2 The X-Diffusion readout: smoothed likelihood-ratio crossing
+Two measured facts close the escape routes a reviewer would try:
 
-With balanced class sampling, the population minimizer of X-Diffusion's BCE (their Eq. 2)
-at noise level $k$ is the Bayes posterior
+1. **Training-time gating cannot zero the first factor.** The X-Diffusion-style co-trained
+   policy (`policy_jar_uni_v10`), trained *with* admission gating, still emits the
+   embodiment-infeasible lid rotation in **12/12 unshielded rollouts** (median first-emission
+   cycle 3 under start perturbation) — a stochastic sampler places nonzero mass on what it
+   has seen, however down-weighted (`scripts/necessity_emission_probe.py`).
+2. **The obvious alternative is worse, not safer.** Hard-filtering the infeasible
+   demonstrations out of training (`policy_jar_ab_nofeas`) removes the *detectable* rotation
+   intent (0/12 emission) but replaces it with **undefined behavior: 25% of rollouts
+   physically penetrate the lid cylinder** with close-intent on the lid. Deleting data does
+   not delete the state region; it deletes the supervision there.
 
-$$c^\star(k, x) \;=\; \frac{p_R^{(k)}(x)}{p_R^{(k)}(x) + p_H^{(k)}(x)},
-\qquad\text{so}\qquad
-c^\star(k,x) \ge \tfrac12 \iff \Lambda_k(x) := \frac{p_R^{(k)}(x)}{p_H^{(k)}(x)} \ge 1 .$$
+So the two gates are **multiplicative complements on the same criterion**, not alternatives:
+training-time admission shapes the distribution; execution-time admission bounds every
+sample. This risk decomposition is the paper's necessity argument and belongs in the intro.
 
-Hence their Eq. 3, $k^\ast(x) = \min\{k : c_\theta(k, x^{(k)}) \ge \tfrac12\}$, is (at the
-population level) **the first noise scale at which the smoothed robot density overtakes the
-smoothed human density at $x$** — a *relative* readout of the family, requiring the human
-foil $\{p_H^{(k)}\}$.
+---
 
-**Proposition A (monotone admission and crossing–distance relation; isotropic model).**
-Let $p_R = \mathcal{N}(\mu_R, s^2 I)$, $p_H = \mathcal{N}(\mu_H, s^2 I)$ and define the
-excess squared distance $\Delta(x) = \lVert x-\mu_R\rVert^2 - \lVert x-\mu_H\rVert^2$.
-Then with $v_k = \bar\alpha_k s^2 + (1-\bar\alpha_k)$,
+## 3. The criterion, formalized: one latent quantity, two estimators
 
-$$\log \Lambda_k(x) \;=\; -\,\frac{\bar\alpha_k}{2 v_k}\,\Delta(x)\;(1 + o(1)),$$
+All symbols and full proofs: `SAFETY_LAYER_MATH_FULL.md`. Summary here.
 
-and $\bar\alpha_k / v_k$ is strictly decreasing in $k$ whenever $s^2 < 1$ (normalized data).
-Consequently (i) $|\log\Lambda_k(x)|$ shrinks monotonically to $0$ — admission is monotone
-in $k$, so the first-crossing time is well defined (this is the population fact our
-monotone regularizer enforces in the finite-sample classifier); and (ii) for any decision
-band $\varepsilon>0$, the crossing time $k^\ast_\varepsilon(x) = \min\{k: |\log\Lambda_k(x)|\le\varepsilon\}$
-is an **increasing function of $\Delta(x)$**: actions farther (in excess) from the robot
-class are admitted only at proportionally larger noise scales. *Proof sketch:* expand both
-smoothed log-densities at equal variance $v_k$; the quadratic difference gives the display;
-monotonicity of $\bar\alpha_k/v_k = \big(s^2 + (1/\bar\alpha_k - 1)\big)^{-1}$ is immediate;
-solve $\bar\alpha_k/v_k = 2\varepsilon/\Delta$ and invert the decreasing map. $\square$
+### 3.1 The shared object
 
-### 1.5.3 The DTE readout: posterior over the noise level itself
+Action chunks are feature vectors x in R^32 (8 steps × 4 chunk-relative channels:
+euler + grip; position-blind by design — in free-space tabletop manipulation positional
+motion is task, orientation/gripper content is embodiment). For the feasible (executed)
+distribution p_R, the forward process of the policy's own scheduler (cosine, K=100,
+a_k = alphas_cumprod) defines the noised family
 
-Train a $(K{+}1)$-way classifier on pairs $(x^{(k)}, k)$ with $x^{(k)} \sim p_R^{(k)}$ and
-$k \sim \mathrm{Unif}\{0..K\}$. The population minimizer of the cross-entropy is the Bayes
-posterior **over the noise ladder of the feasible family alone**:
+    p_R^(k)(x) = ∫ p_R(x0) · N(x; sqrt(a_k)·x0, (1−a_k)·I) dx0 ,   k = 0..K,
 
-$$q(k \mid x) \;=\; \frac{p_R^{(k)}(x)}{\sum_{j=0}^{K} p_R^{(j)}(x)},
-\qquad
-\hat t(x) \;=\; \mathbb{E}[k \mid x] \;=\; \sum_k k\, q(k\mid x).$$
+a Gaussian scale-space of the feasible action distribution. **Both estimators below are
+functionals of this same family, in the same units (the schedule's k-axis).**
 
-This is an *intrinsic* readout of the same family — no foil distribution appears anywhere.
+### 3.2 Estimator 1 — the lineage's classifier readout (relative; needs a foil)
 
-**Proposition B (distance monotonicity of $\hat t$; Gaussian case).** Let
-$p_R = \mathcal{N}(\mu, s^2 I)$ with $s^2 < 1$, and $r = \lVert x - \sqrt{\bar\alpha_k}\,\mu\rVert$
-(for clarity take $\mu=0$, $r=\lVert x\rVert$). Then $p_R^{(k)} = \mathcal{N}(0, v_k I)$ with
-$v_k$ strictly increasing in $k$, and for $r_1 < r_2$ the ratio
-$q(k\mid r_2)/q(k\mid r_1) \propto \exp\!\big(-(r_2^2-r_1^2)/(2v_k)\big)$ is strictly
-increasing in $k$ (monotone likelihood ratio). Hence $q(\cdot\mid r_2)$ stochastically
-dominates $q(\cdot\mid r_1)$ and $\hat t(x)$ is **strictly increasing in the distance $r$
-from the feasible distribution**. $\square$
-For non-Gaussian, manifold-supported $p_R$, Livernoche et al. (ICLR 2024) derive the
-analytic posterior and show it depends on $x$ through its distance to the data — the same
-monotone-distance semantics in the general case.
+The population minimizer of the noise-conditional BCE is the Bayes posterior
+c*(k,x) = p_R^(k)(x) / (p_R^(k)(x) + p_C^(k)(x)) against a contrast class p_C (human data in
+X-Diffusion; mined rotation counterfactuals in our task-adapted teacher). The admission time
+k*(x) = min{k : c(k, x^(k)) ≥ 1/2} is the first noise level at which the smoothed feasible
+density overtakes the smoothed contrast density at x.
 
-Propositions A and B are the formal content of "two readouts of one quantity": both
-$k^\ast$ and $\hat t$ are increasing functions of how far $x$ sits from the feasible
-family, measured **in units of the same forward-diffusion noise schedule**. Empirically, on
-1,649 real chunks Spearman $\rho(k^\ast, \hat t) = 0.765$ (0.881 within the discriminative
-range).
+**Theorem T1** (isotropic Gaussian idealization): log LR_k(x) = −(1/2)·g(k)·Delta(x) with
+g(k) = sqrt(a_k)/v_k strictly decreasing, Delta(x) the excess squared distance to the
+feasible mean — hence admission is monotone in k and the (eps-banded) crossing time is
+**strictly increasing in Delta(x)**. External anchors: Ambient Omni Thm 4.2 (TV of the
+noised pair decays ~ D/(2σ)); randomized smoothing (Cohen et al., ICML 2019: a noise scale
+converts classifier confidence into a certified distance).
 
-### 1.5.4 One family, two contrast schemes (the NCE/TRE view)
+### 3.3 Estimator 2 — the one-class readout (intrinsic; foil-free)
 
-Both classifiers are noise-contrastive estimators on the same ladder:
+Train a (K+1)-way classifier on (x^(k), k) pairs drawn from the feasible data alone
+(self-supervised: the label k is set by us when we add the noise). The population minimizer
+is q(k|x) = p_R^(k)(x) / Σ_j p_R^(j)(x), and the score is the posterior mean
+t_hat(x) = E[k|x]. No contrast class appears anywhere — the noise ladder is its own foil.
 
-- X-Diffusion, at each rung $k$, contrasts $p_R^{(k)}$ **against $p_H^{(k)}$** — a
-  telescoping-bridge family with the human dataset as the foil (cross-embodiment
-  contrast);
-- DTE contrasts the rungs $\{p_R^{(j)}\}_j$ **against each other** — the optimal logits of
-  the $(K{+}1)$-way CE recover $\log p_R^{(k)}(x)$ up to an $x$-dependent constant, i.e.
-  the ladder itself supplies the negatives (cross-noise-level contrast).
+**Theorem T2** (Gaussian idealization): q(k|·) has the monotone-likelihood-ratio property in
+distance, so by stochastic dominance t_hat is **strictly increasing in the distance from the
+feasible distribution**. External anchors, verified 08-24:
+- **Livernoche et al., ICLR 2024 Spotlight (arXiv:2305.18593)** — the DTE origin — prove the
+  posterior over the noise variance is **Inverse-Gamma(d/2−1, ‖x−x0‖²/2)** with x0 the
+  nearest data point: t_hat is an *explicit monotone function of squared distance to the
+  data*, with anomaly rankings provably identical to kNN. This covers the general
+  (non-Gaussian, manifold) case.
+- Abuduweili et al., TMLR 2025 (arXiv:2412.05488), verbatim: "the noise level … approximates
+  their distance to the underlying manifold"; Permenter & Yuan, ICML 2024: denoising ≈
+  gradient descent on the distance-to-manifold function with σ_t as the running distance
+  estimate.
 
-Removing the human foil therefore does not change the estimated object — only the contrast
-used to estimate it. This is the precise sense in which the extension is foil-free rather
-than method-new.
+### 3.4 The equivalence (the mathematical heart of "extension, not combination")
 
-### 1.5.5 Decision layer: distribution-free calibration of the readout
+T1 and T2 say: **k* and t_hat are two strictly-increasing readouts of the same latent
+quantity — distance to the feasible action manifold — measured in the same noise-schedule
+units.** Three independent formal bridges:
 
-Let $s(x)$ be either readout ($\hat t$ in the deployed system) and
-$S = \{s(x_1),\dots,s(x_n)\}$ scores of held-out **executed** (hence feasible) chunks.
+- **I-MMSE** (Guo–Shamai–Verdú, IEEE TIT 2005): dI/dSNR = MMSE/2 — the classifier-side
+  object (information/distinguishability along the noise axis) and the one-class-side object
+  (denoising error along the noise axis) are derivatives of one function.
+- **Classification Diffusion Models** (Yadin et al., NeurIPS 2024, arXiv:2402.10095): the
+  cross-entropy-optimal *noise-level classifier* and the MSE-optimal *denoiser* are
+  analytically equivalent — the precise sense in which the one-class task estimates the same
+  object as the density family.
+- **NCE/TRE lineage** (Gutmann & Hyvärinen 2010; Rhodes et al., NeurIPS 2020; DRE-∞, Choi et
+  al., AISTATS 2022): X-Diffusion's classifier contrasts p_R^(k) against p_C^(k) at each
+  rung (human foil); DTE contrasts the rungs against each other (the ladder is the foil).
+  Same estimated family, different contrast scheme.
 
-**Proposition C (conformal false-veto guarantee).** If a new feasible chunk $x_{n+1}$ is
-exchangeable with the calibration chunks, then with
-$\hat s_\alpha = S_{(\lceil (n+1)(1-\alpha)\rceil)}$ (order statistic),
+**Measured anchor (jar task, 1,649 real chunks):** Spearman rho(k*, t_hat) = **0.765**
+overall, **0.881** within the discriminative range; both floor at 0 on approach/executed
+pools; both elevate on rotation (k* med 44; plain t_hat med 7.1). One quantity, two
+estimators.
 
-$$\mathbb{P}\big(s(x_{n+1}) > \hat s_\alpha\big) \;\le\; \alpha,$$
+### 3.5 Why the one-class estimator is the deployable one
 
-finite-sample and distribution-free (split conformal). The only free parameter is the risk
-budget $\alpha$; no score-unit threshold is tuned.
+The two-class design has a generalization dead-end: its negative class requires task
+knowledge (one must know *a priori* that "the infeasible thing here is lid rotation" to
+build counterfactuals). The one-class estimator removes that dependency — "infeasible"
+always means "far from this task's executed actions" — so the criterion becomes portable to
+any task that has executed data. This is what makes execution-time admission *deployable*
+where the lineage's own classifier is not.
 
-**Proposition D (deployed statistic; Bonferroni).** The deployed vote is pessimistic over
-$m$ policy draws per cycle ($m=3$): flag if $\max_{j\le m} s(x^{(j)}) > \hat s_{\alpha/m}$.
-If each draw is marginally exchangeable with calibration when the policy is in a feasible
-mode, the union bound gives per-cycle false-flag probability $\le \alpha$. (This is why the
-deployed level is $\alpha/m = 0.01/3 \approx 0.0033$: **calibrate the statistic actually
-deployed** — per-draw calibration under pessimistic voting was the root cause of the
-08-19 false vetoes.)
+---
 
-The M-of-N vote and latch sit above these marginal guarantees as deterministic logic; the
-sequential (e-process) layer with anytime-valid guarantees is future work (known one-class
-calibration-drift gap, Sec. 8 of the DTE readme).
+## 4. The classifier's one last duty: k*-anchored calibration transfer
 
-### 1.5.6 Lifecycle risk decomposition (why both gates are needed)
+### 4.1 The identifiability problem distillation solves
 
-For a stochastic policy $\pi$ and monitor $M$, per cycle
+The self-supervised DTE objective constrains the *ranking* of scores but under-determines
+their *absolute scale* (plain student: rotation t_hat med 7.1 where the teacher reads 44 —
+correct order, wrong units). The teacher's scale is not arbitrary: k* units are the
+operational units of the lineage's own training rule (X-Diffusion Eq. 4 consumes them
+literally). Aligning the student to them is a **calibration transfer**, in the metrology
+sense (primary standard → working instrument; Workman, *Applied Spectroscopy* 2018).
 
-$$\mathbb{P}(\text{infeasible executed}) \;=\; \underbrace{\mathbb{P}_\pi(\text{infeasible emitted})}_{\text{training-time gate shrinks}} \times \underbrace{\mathbb{P}_M(\text{miss} \mid \text{emitted})}_{\text{execution-time gate bounds}} .$$
+### 4.2 The mechanism (implemented, measured)
 
-Training-time admission (X-Diffusion) shapes the *distribution* — it cannot zero the first
-factor for a sampler (measured: 12/12 unshielded rollouts emit rotation), and deleting the
-infeasible data instead replaces detectable intent with undefined behavior (25 % lid-cylinder
-penetration in the hard-filter ablation). The execution-time gate controls the second factor
-with the conformal guarantee on false vetoes and empirically measured miss rates. The two
-gates are multiplicative complements on the same criterion, not alternatives.
+    L(phi) = CE(self-supervised noise-step prediction; executed data)
+           + lambda · mean_x[ (t_hat_phi(x)/100 − k*_teacher(x)/100)² ]
 
-## 2. The story arc: one criterion, two gates, one axis
+Teacher = the frozen task-adapted discriminator (`kstar_cls.pth`), 6 noise draws per k.
+Pool = **5,449 unlabeled source-task chunks** (2,500 executed + 2,500 human-quiet + 449
+human-demo rotation windows — all data that exists anyway; **no feasibility labels
+anywhere**). lambda = 1.0 saved as `dte_distilled.pth` (`scripts/dte_distillation.py`).
+At a *new* task the teacher is absent by design: the student adapts self-supervised and is
+re-zeroed conformally (§6).
 
-> X-Diffusion asks: *how much noise until a human action may TEACH the robot?*
-> We ask the dual: *how much noise until the robot's own action is EXPLAINED by what it
-> has executed?* Same criterion, extended from learning to acting.
+### 4.3 What it provably cannot change, and what it measurably did
 
-- **Step 0 (X-Diffusion, prior work).** Admission time k* gates which human actions
-  enter the denoising loss — a **training-time data gate**. The classifier is discarded
-  after training; deployment is the bare policy.
-- **Step 1 (ours, robot-verified).** The same admission time, enforced at **execution
-  time**: score every policy-emitted chunk, veto when the admission time exceeds the
-  feasible range. *Necessity is measured, not assumed*: the stochastic policy emits
-  rotation in 12/12 unshielded rollouts (median first emission cycle 3 under start
-  perturbation), and the training-time alternative (hard-filtering infeasible data)
-  does not produce safety but **undefined behavior** — 25% of rollouts physically
-  penetrate the lid cylinder, with close-intent on the lid. Training-time gating shapes
-  the mean; only execution-time gating bounds every sample.
-- **Step 2 (ours).** Foil-free estimation of the same admission time: replace the human
-  foil with the noise ladder itself (DTE). This removes the task-specific negative
-  requirement (the human/counterfactual dataset) — the criterion becomes portable to any
-  task that has executed data. Zero-shot cross-task evidence: jar-trained DTE accepts
-  handover executed chunks at 1.3% ≈ alpha.
-- **Step 3 (ours).** Calibration: the fixed 0.5 crossing / hand threshold is replaced by
-  a conformal quantile of executed-chunk scores with a user-interpretable risk budget
-  alpha (finite-sample guarantee; Bonferroni-corrected for the pessimistic multi-draw
-  vote).
+**Theorem T3** (rank invariance): every rank-based decision — the conformal p-value, the
+per-chunk veto — is invariant under strictly monotone rescaling of the score. So
+distillation *cannot* move the per-chunk operating point, and indeed did not (P2 below).
+What it can move is *magnitudes*: margins, and anything magnitude-sensitive (the sequential
+e-detector's growth rate). Measured outcomes (offline replay, within-run baselines,
+2026-08-20):
 
-## 3. The concrete interaction: k*-anchored distillation (proposed, testable)
-
-The user-visible question "do the two networks interact?" has a clean affirmative
-mechanism — **the pre-trained X-Diffusion discriminator calibrates the one-class
-network's time axis**:
-
-    L(phi) = L_DTE(phi; executed data)                    # self-supervised, foil-free
-           + lambda * E_x [ (t_hat_phi(x) - k*_theta(x))^2 ]   # teacher anchoring, source task
-
-- The teacher is **free**: every X-Diffusion policy training already produces the
-  discriminator; instead of discarding it (as the original paper does), we distill its
-  noise-scale semantics into the deployable one-class monitor.
-- What distillation transfers is exactly what pure one-class training failed to acquire
-  (measured): the **foil-induced invariances** (texture equalization; ours showed
-  sequential-layer drift 8/34 stream FA and a null positive-augmentation ablation).
-  Precedent for teacher-student one-class monitoring: reverse distillation
-  (CVPR 2022, 2023).
-- At a **new task** the teacher is absent by design — DTE adapts self-supervised on that
-  task's executed data while keeping the inherited invariances/axis.
-- Bonus: t-hat lands on the same 0-100 k-axis as X-Diffusion's k*, so all of the
-  original paper's semantics (Fig. 3-style visualizations, "indistinguishability step")
-  carry over verbatim to deployment plots.
-
-Testable predictions and MEASURED OUTCOMES (offline replay, 2026-08-20; within-run
-baselines, since eval pools grew with the 08-18/19 sessions — plain vs distilled trained
-and evaluated identically in one script, teacher labels on 5,449 unlabeled source chunks):
-
-- **Axis calibration (the core "calibrate the noise step" goal): CONFIRMED.** Distillation
-  moves the student's scale onto the teacher's k-axis: rotation t-hat median 7.1 -> **49.4**
-  (teacher k* median 44), while feasible calibration scores stay low (q99 0.26 -> 0.76).
-  The absolute separation margin widens ~2.4x; the student now *reads in k\* units*.
-- **P1 (sequential stability): partially confirmed.** e-detector feasible-stream FA
-  12/40 -> **7/40** (-42%); slow-rotation sequential detection reaches teacher level:
-  miss 17% -> **1%**, delay 5 -> **2 cycles** (teacher: 2 cycles / 10% miss). Gap to the
-  teacher's FA level remains.
-- **P2 (per-chunk veto power): not confirmed.** 86.4% unchanged @ 1% FA (teacher 91.5%) —
-  distillation reshapes margins, not the alpha=1% ROC point.
-- **P3 as originally stated: refuted, metric was ill-chosen.** Spearman rho is
-  scale-invariant, and ranks barely move (0.763 -> 0.766). The intended goal behind P3 is
-  the axis calibration above, which succeeded; rank refinement would need a ranking loss,
-  not MSE.
+- **Axis calibration — CONFIRMED (the core goal).** Rotation t_hat med 7.1 → **49.4**
+  (teacher k* med 44); feasible calibration scores stay low (q99 0.26 → 0.76); absolute
+  separation margin widens **~2.4×**. The student now reads in k* units.
+- **Sequential layer — improved.** e-detector feasible-stream FA 12/40 → **7/40**;
+  slow-rotation miss **17% → 1%**, delay 5 → **2 cycles** (teacher: 2 cycles / 10% miss).
+- **Per-chunk veto power — unchanged, as T3 requires.** 86.4% @ 1% FA before and after
+  (teacher 91.5%).
+- **Rank correlation — unchanged (0.763 → 0.766), as T3 predicts**; the original P3
+  metric was ill-chosen (Spearman is scale-invariant by construction).
+- The non-monotone residual of the transfer is **concentrated at the decision boundary**
+  (2.1% rank reordering; |score shift| grows monotonically with the teacher's k* bin,
+  0.04 → 3.02): the teacher injects its foil-induced invariances exactly where decisions
+  are made — which is why the magnitude-sensitive sequential layer improved while
+  rank-based per-chunk metrics stayed fixed. This rank-invariant/magnitude-sensitive
+  dichotomy has pieces in the conformal literature but no complete statement; we state it
+  as a small proposition.
 - **Cross-task acceptance preserved:** jar-distilled student still accepts handover
-  executed chunks at 1.3% ~= alpha.
+  executed chunks at 1.3% ≈ alpha.
 
-Net: the interaction is real and useful — the teacher transfers its *scale and margins*
-into the foil-free student (sequential slow-rotation closes to teacher level, sequential
-FA halves), while the per-chunk operating point and ranking remain student-limited.
-Artifacts: `scripts/dte_distillation.py`, checkpoint `kstar_uni/dte_distilled.pth`
-(lam=1.0; NOT deployed — deployed shield remains dte_oneclass.pth).
+Precedents to cite: teacher-student anomaly detection (Bergmann et al., CVPR 2020; Deng &
+Li, CVPR 2022; Tien et al., CVPR 2023); calibration transfer in metrology (Workman 2018).
+**No prior work found (08-24 search) that distills a two-class noise-conditional teacher
+into a one-class diffusion-time student to transfer its decision scale — claim "to our
+knowledge" novel.**
 
-Secondary interactions (mention, not headline): the discriminator as **curator** of the
-student's feasible corpus (k* <= tau filter replacing the heuristic euler filter);
-agreement/disagreement between the two readouts as a runtime self-diagnosis signal.
+Honest deployment note: the robot-verified shield runs `dte_oneclass.pth` (plain student +
+conformal); `dte_distilled.pth` is the measured interaction mechanism, not yet the deployed
+weights. State this plainly in the paper (the distilled student's per-chunk behavior is
+provably identical; what hardware would gain is the sequential layer, which is future work).
 
-## 4. Paper skeleton
+---
 
-1. Background: X-Diffusion; feasibility = minimum indistinguishability step (their
-   Eq. 2-3); classifier used only to admit data into training.
-2. **Claim: admission belongs at both ends of the lifecycle.** Risk decomposition
-   P(execute infeasible) = P(emit) x P(monitor miss); training-time gating cannot zero
-   the first factor for a stochastic sampler (12/12 emission; hard-filter ablation).
-3. Same axis, execution gate: the k* shield (robot-verified demo), all veto machinery.
-4. Foil-free admission time: DTE as the intrinsic readout (rho=0.88 equivalence), zero
-   negatives, cross-task recipe + zero-shot handover evidence.
-5. k*-anchored distillation: the pretrained discriminator calibrates the deployable
-   monitor's axis and invariances (P1-P3).
-6. Conformal calibration: risk-budget alpha, deployed-statistic correction (alpha/n_draws).
-7. Hardware: unified Nutella task, both modes, banner demo; offline replay suite.
+## 5. From scores to vetoes: conformal admission with a risk budget
 
-## 5. Key sentences (for abstract/intro)
+### 5.1 The guarantee
 
-- "X-Diffusion decides which human actions may teach a robot; we extend the same
-  criterion to decide which of its own actions a robot may execute."
+Split conformal on n held-out **executed** (hence feasible) chunks: s_alpha = the
+ceil((n+1)(1−alpha))-th smallest calibration score. **Theorem T4:** for a new feasible
+chunk exchangeable with calibration, P(s(x) > s_alpha) ≤ alpha — finite-sample,
+distribution-free. This is verbatim the conformal outlier p-value guarantee of **Bates,
+Candès, Lei, Romano, Sesia (Ann. Statist. 2023, arXiv:2104.08279)** (marginal validity;
+decisions across chunks are dependent through the shared calibration set — say so).
+
+**The only free parameter is alpha — an interpretable risk budget ("what fraction of
+feasible actions I tolerate pausing"), not a score-unit magic number.** This replaces both
+the lineage's fixed 0.5 crossing and our own earlier hand-tuned tau = 17.
+
+### 5.2 Calibrate the statistic you actually deploy (Bonferroni, with an admissibility card)
+
+The deployed vote is pessimistic over n_d = 3 policy draws per cycle (flag on the worst
+draw). Per-draw calibration under pessimistic voting inflates the per-cycle false-alarm
+rate ~n_d× — this was the *measured root cause of the 2026-08-19 false vetoes on hardware*
+(a paper-worthy lesson in itself). **Theorem T5:** calibrating at alpha/n_d restores the
+per-cycle bound (union bound). Deployed: n_cal = 1,778, alpha = 0.01/3 ≈ 0.0033,
+s_alpha = 0.53, 2-of-3 voting + latch.
+
+Reviewer-proofing (verified 08-24): **Vovk–Wang–Wang (Ann. Statist. 2022)** prove that
+Bonferroni/min-p merging is not only valid under *arbitrary* dependence but **admissible** —
+it cannot be uniformly improved without dependence assumptions (Simes needs PRDS). Our
+alpha/n_d is the assumption-free admissible choice, not a hack.
+
+### 5.3 Placement in the calibration literature
+
+- Our rule is the **0–1-loss special case of Conformal Risk Control** (Angelopoulos et al.,
+  ICLR 2024) — the door to non-binary risks (cost-weighted halting) is open and free.
+- The one strictly-more-elegant alternative that exists: **conformal e-values** (the mean of
+  e-values is an e-value → the 3-draw vote merges with *no* Bonferroni penalty, and the
+  per-chunk and sequential layers share one anytime-valid currency). Cost: per-chunk power
+  and reviewer familiarity. Verdict: keep p-based per-chunk + e-based sequential; one
+  related-work sentence acknowledging the e-value unification.
+- Every alternative threshold philosophy surveyed (entropy/MSP, energy, ODIN,
+  likelihood-ratio, PAC-OOD, selective prediction) either leaves the threshold as an
+  unguaranteed hand-set artifact, needs negative/failure data, or carries heavier
+  assumptions — the systematic argument for conformal in the one-class safety setting.
+
+---
+
+## 6. Cross-task generalization: the metrology loop (the answer to "one classifier per task?")
+
+The question the narrative must answer: *does a new task need a new classifier?* **No** —
+and the three-part argument keeps each claim at exactly the strength we can prove:
+
+1. **Units transfer by construction.** Both estimators are indexed on the policy lineage's
+   shared noise schedule; the k-axis is task-invariant by definition.
+2. **Geometry transfers empirically, under a stated assumption (A1: shared feasible core
+   in chunk-relative, position-blind coordinates).** Zero-shot probes, jar-trained student
+   on handover data: acceptance of executed chunks 1.3% ≈ alpha (unit consistency:
+   graded synthetic rotations read 10.9 vs 9.3 and 42.6 vs 36.4 at matched intensities;
+   detection 98–100%). Scoped to free-space tabletop manipulation; stated as an empirical
+   regularity, not a theorem.
+3. **The decision guarantee transfers unconditionally.** T4 holds verbatim on any task
+   after re-zeroing: collect ~10 executed runs, recompute the quantile. **No negatives, no
+   teacher, no retraining required** (measured degradation with single-run calibration:
+   7.6–13.6% vs 1.3% — say so, and recommend ≥10 runs).
+
+The metrology summary (one figure in the paper): the two-class discriminator is the
+**primary standard** — it exists once, at the source task, where the lineage already trained
+it; the DTE network is the **portable working instrument**; distillation is the **one-time
+calibration transfer**; per-task conformal re-zeroing is **field use**. The classifier's
+per-task cost is exactly zero because it is never needed again.
+
+---
+
+## 7. Hardware evidence inventory (honest attribution)
+
+| Evidence | Shield version | Numbers |
+|---|---|---|
+| Live veto demo, jar task, mode A (robot must NOT rotate lid) | two-class k* shield (08-13, robot-verified, user-declared perfect) | veto 100%, feasible-phase FPR 5.4%, onset detection 87.5% |
+| Live deployment, both collaboration modes, full task cycles incl. release | **DTE one-class shield** (08-18/19 sessions, after calibration fix) | modes A+B verified; false-veto bug root-caused and fixed (per-draw→per-statistic calibration); rehearsal: feasible FA 0%, rotation veto power 82% @ deployed threshold |
+| Unshielded emission (necessity) | none | 12/12 rollouts emit rotation |
+| Hard-filter ablation (necessity) | none | 0/12 emission but 25% lid-cylinder penetration |
+| Offline replay suite | plain vs distilled DTE, teacher reference | §4.3 numbers; teacher 91.5% veto @1%FA / seqFA 1/34 |
+| Cross-task (handover) | jar-trained DTE, re-zeroed | 1.3% ≈ alpha acceptance; small-N (2 runs) — preliminary, must be labeled as such |
+
+Honest limits (state in the paper, every time): one platform (UR10e); two tasks; the
+sequential e-detector layer is offline-validated but not yet on hardware; theory exact in a
+Gaussian idealization with the manifold case covered by citation (Livernoche); conformal
+guarantee is marginal and per-chunk, session-level control only in expectation; A1 is an
+empirical regularity scoped to free-space tabletop tasks; the deployed weights are the plain
+(not distilled) student.
+
+---
+
+## 8. Novelty scope and positioning (each claim against its nearest prior art)
+
+| Our claim | Nearest prior art | The differentiating fact |
+|---|---|---|
+| (i) Execution-time enforcement of the admission criterion (veto, not alarm) | Ambient Omni / Ambient Diffusion Policy / X-Diffusion — all training-time-only ("Inference: no changes") | first to run the lineage's own criterion at the exit of the lifecycle |
+| (ii) One-class estimation of admission time + equivalence theory | Livernoche et al. ICLR 2024 (DTE, general AD); Diff-DAgger (test-time denoising loss, but gates expert queries in DAgger, no deployment shield) | first use of predicted diffusion time as a *vetoing* runtime shield for robot actions; T1/T2 equivalence on one schedule is new |
+| (iii) k*-anchored distillation (two-class noise-conditional teacher → one-class student, transferring decision scale) | teacher-student AD (Bergmann 2020; Deng & Li 2022) — teachers are pretrained feature nets, not decision-scale calibrators | no precedent found (08-24); "to our knowledge" |
+| (iv) Conformal false-veto guarantee, Bonferroni-corrected for the deployed voting statistic | FIPER (NeurIPS 2025), FAIL-Detect (RSS 2025) — conformal-calibrated runtime failure *alarms* | we differentiate on the score (the lineage's own criterion vs RND/entropy/density) and on the action (hard veto vs alarm); Vovk–Wang–Wang admissibility for the multi-draw correction |
+
+Positioning vs the runtime-monitor family (Sentinel CoRL 2024; FIPER; FAIL-Detect; SAFE
+NeurIPS 2025): those detect "the policy is failing" — OOD observations, erratic/inconsistent
+actions, high entropy. Our target failure mode is their blind spot: **the policy confidently
+executing something embodiment-infeasible** — in-distribution, low-entropy, temporally
+consistent, and wrong. Complementary, not competing; one sentence in related work.
+
+Positioning vs model-based safety filters (SafeDiffuser ICLR 2025; path-consistent filtering
+ICRA 2026; CBF/shielding/RTA lineage per Hsu–Hu–Fisac 2024): those need explicit constraint
+or dynamics models; our score is learned from executed data alone and targets feasibility
+constraints nobody wrote down. (Note: the ICRA 2026 filtering paper and FIPER share a first
+author in our own institute — coordinate, and cite generously.)
+
+---
+
+## 9. The paper skeleton (Skeleton A — primary)
+
+**Title:** *Runtime Admission Control for Cross-Embodiment Diffusion Policies*
+(optional subtitle: *Finite-Sample Feasibility Vetoes from the Policy's Own Training
+Criterion*)
+
+**Abstract draft:**
+
+> X-Diffusion trains diffusion policies on human demonstrations by admitting each
+> retargeted human action into the loss only above its *admission time* — the earliest
+> noise level at which a human-vs-robot classifier can no longer distinguish it from robot
+> actions. We show this criterion is enforced at training yet still needed at execution:
+> the classifier is discarded, the deployed policy remains stochastic, and on a physical
+> UR10e it attempted an embodiment-infeasible lid rotation in 12 of 12 unshielded
+> jar-opening rollouts, while hard-filtering the offending demonstrations instead produced
+> undefined behavior with physical penetration events in 25% of rollouts. We therefore
+> extend admission control to execution time using the same criterion: a one-class
+> diffusion time estimation network predicts, per candidate action chunk, the noise level
+> it appears drawn from — a quantity that, like the classifier's admission time, is
+> provably strictly increasing in the distance to the feasible-action manifold. The
+> discarded classifier serves exactly once more, as a primary standard: a one-shot
+> distillation aligns the estimator's scale to the training-time admission axis, after
+> which no negative data are ever required. Split-conformal calibration on executed robot
+> actions turns scores into vetoes, so the only free parameter is a user-chosen risk
+> budget bounding the false-veto rate in finite samples, Bonferroni-corrected for
+> pessimistic voting over three action draws. On the UR10e the gate vetoes infeasible lid
+> rotations live in both modes of a human-robot jar-opening task, and a preliminary study
+> shows transfer to a handover task after re-zeroing the calibration alone.
+
+**Sections:**
+1. Introduction: Admission Is a Lifecycle Property, Not a Training Trick
+2. Background: the admission-time lineage (Ambient Omni → Ambient Diffusion Policy →
+   X-Diffusion) and the unguarded exit
+3. What Survives the Training Gate: infeasible emission (12/12) and the filtering dilemma
+   (25%) — the risk decomposition
+4. Estimating Admission Without Negatives: one-class DTE, monotonicity theorems (T1/T2),
+   equivalence, and one-shot classifier distillation (T3 + measured margins)
+5. From Scores to Vetoes: split-conformal admission with a risk budget (T4/T5,
+   admissibility)
+6. Hardware Study: jar opening in both collaboration modes; preliminary handover transfer;
+   limitations
+
+**Key sentences:**
+- "We do not bolt a new safety monitor onto X-Diffusion; we complete its own
+  admission-time criterion across the policy's lifecycle."
 - "One criterion — the diffusion admission time; two gates — into training, into
   execution; one axis — the policy's own forward process."
-- "Where X-Diffusion contrasts human against robot at every noise level, we let the
-  noise ladder itself supply the contrast — the criterion survives when no human foil
-  exists."
-- "The discriminator that X-Diffusion discards after training is precisely the teacher
+- "Where the lineage contrasts human against robot at every noise level, we let the noise
+  ladder itself supply the contrast — the criterion survives when no foil exists."
+- "The classifier the lineage discards after training is precisely the primary standard
   that calibrates the deployable monitor."
+- "Training-time admission shapes the distribution; only execution-time admission bounds
+  every sample."
 
-## References (beyond the X-Diffusion paper)
+**Alternatives held in reserve:**
+- **Skeleton B — "One Criterion, Two Estimators"** (metrology-forward; strongest conceptual
+  framing; best for CoRL 2027 if RA-L reviewers ask for more conceptual novelty).
+- **Skeleton C — "Admitted in Training, Vetoed in Execution: Closing the Feasibility
+  Loop"** (hazard-first; 12/12 and 25% in the second sentence; best for ICRA 2027).
 
-- Livernoche et al. On Diffusion Modeling for Anomaly Detection (DTE). ICLR 2024.
-- Rhodes, Xu, Gutmann. Telescoping Density-Ratio Estimation. NeurIPS 2020.
-- Gutmann & Hyvarinen. Noise-Contrastive Estimation. AISTATS 2010.
-- Deng & Li. Anomaly Detection via Reverse Distillation from One-Class Embedding. CVPR 2022;
-  Tien et al., Revisiting Reverse Distillation. CVPR 2023.
-- Angelopoulos & Bates et al. Learn then Test / conformal risk control. AOAS 2025.
-- Daras et al. Ambient Diffusion (Omni) — the data-quality classifier lineage X-Diffusion builds on.
+---
+
+## 10. Venue strategy
+
+- **Primary: RA-L** (6 pages + 2 at charge; ICRA/IROS presentation option; 30-day R&R).
+  The letter format matches our evidence shape exactly: one sharp claim + finite-sample
+  guarantee + single-platform hardware validation (peer scale: Sentinel 1–2 real tasks;
+  FIPER 1 real task, 10 calibration rollouts; Lindemann RA-L 2023 is the in-venue template
+  for "the only knob is a user-defined risk").
+- **If conference speed is wanted: ICRA 2027, deadline 2026-09-15** (~3 weeks) with
+  Skeleton C. X-Diffusion itself is ICRA 2026 — same audience.
+- CoRL 2026 has passed; CoRL 2027 (~May) is the fallback with Skeleton B.
+- **Speed matters:** the space is converging fast (FIPER NeurIPS 2025 + ICRA 2026 safety
+  filtering from the same institute; Ambient Diffusion Policy June 2026). T-RO is the
+  *extended* follow-up (second platform / third task), not the first submission.
+
+Pre-submission work items (from the 08-22 assessment, unchanged): (a) compile the hardware
+metrics table from deploy logs; (b) replay FIPER-style (entropy/RND) and Sentinel-style
+(consistency) baselines on our recorded streams to populate the comparison table; (c) add
+handover deployment runs to lift the transfer study above small-N.
+
+---
+
+## 11. Verified citation set (all arXiv IDs fetched 08-24)
+
+**Lineage (the object):** Pace et al., X-Diffusion, ICRA 2026, arXiv:2511.04671 · Daras et
+al., Ambient Diffusion Omni, NeurIPS 2025 Spotlight, arXiv:2506.10038 (t_min, Thm 4.2) ·
+Wei et al., Ambient Diffusion Policy, arXiv:2606.12365 ("Inference: no changes") · Daras et
+al., Ambient Diffusion, NeurIPS 2023.
+
+**One-class score + monotonicity:** Livernoche et al., ICLR 2024 Spotlight, arXiv:2305.18593
+(Inverse-Gamma posterior; kNN equivalence) · Abuduweili et al., TMLR 2025, arXiv:2412.05488 ·
+Permenter & Yuan, ICML 2024, arXiv:2306.04848 · Graham et al., CVPR-W 2023, arXiv:2211.07740 ·
+Mahmood et al., ICLR 2021, arXiv:2010.13132.
+
+**Equivalence machinery:** Guo, Shamai, Verdú, IEEE TIT 2005 (I-MMSE) · Yadin et al.,
+NeurIPS 2024, arXiv:2402.10095 (CDM) · Choi et al., AISTATS 2022, arXiv:2111.11010 (DRE-∞) ·
+Rhodes et al., NeurIPS 2020, arXiv:2006.12204 (TRE) · Gutmann & Hyvärinen, AISTATS 2010
+(NCE) · Cohen et al., ICML 2019, arXiv:1902.02918 (randomized smoothing).
+
+**Decision layer:** Bates et al., Ann. Statist. 2023, arXiv:2104.08279 (conformal outlier
+p-values) · Vovk, Wang, Wang, Ann. Statist. 2022 (admissible p-merging → Bonferroni) ·
+Angelopoulos et al., ICLR 2024 (Conformal Risk Control) · Tibshirani et al., NeurIPS 2019
+(weighted conformal; covariate-shift transfer) · Gibbs & Candès, NeurIPS 2021 (ACI; drift
+discussion) · Shin, Ramdas, Rinaldo, arXiv:2203.03532 (e-detectors) · Volkhonskiy et al.,
+COPA 2017 (inductive conformal martingales) · Vovk et al., ICML 2003 (testing
+exchangeability online) · Bashari et al., NeurIPS 2023, arXiv:2302.07294 (conformal
+e-values).
+
+**Runtime monitors / robotics:** Agia et al., Sentinel, CoRL 2024, arXiv:2410.04640 · Römer
+et al., FIPER, NeurIPS 2025, arXiv:2510.09459 · Xu et al., FAIL-Detect, RSS 2025,
+arXiv:2503.08558 · Gu et al., SAFE, NeurIPS 2025, arXiv:2506.09937 · Ren et al., KnowNo,
+CoRL 2023, arXiv:2307.01928 · Lindemann et al., RA-L 2023, arXiv:2210.10254 · Diff-DAgger,
+arXiv:2410.14868 · SafeDiffuser, ICLR 2025, arXiv:2306.00148 · Römer et al., path-consistent
+safety filtering, ICRA 2026, arXiv:2511.06385 · Alshiekh et al., AAAI 2018 (shielding) ·
+Hsu, Hu, Fisac, Annu. Rev. Control Robot. Auton. Syst. 2024 (safety-filter survey).
+
+**Reuse-and-distillation precedents:** Azadi et al., ICLR 2019, arXiv:1810.06758
+(Discriminator Rejection Sampling) · Valvano et al., 2021, arXiv:2108.12280 (lifecycle
+rhetoric) · Li et al., ICCV 2023, arXiv:2303.16203 · Bergmann et al., CVPR 2020 (Uninformed
+Students) · Deng & Li, CVPR 2022 (Reverse Distillation) · Tien et al., CVPR 2023 · Workman,
+Applied Spectroscopy 2018 (calibration transfer / metrology).
